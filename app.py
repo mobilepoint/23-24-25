@@ -349,7 +349,10 @@ def load_profit_file_to_staging(xls_bytes: bytes, expected_period: date, source_
 
     # validare lună
     if perioada != expected_period:
-        raise RuntimeError(f"Fișierul este pentru {perioada.strftime('%Y-%m')}, dar aici acceptăm doar {expected_period.strftime('%Y-%m']}.")
+        raiseraise RuntimeError(
+    f"Fișierul este pentru {perioada.strftime('%Y-%m')}, dar aici acceptăm doar {expected_period.strftime('%Y-%m')}."
+)
+RuntimeError(f"Fișierul este pentru {perioada.strftime('%Y-%m')}, dar aici acceptăm doar {expected_period.strftime('%Y-%m']}.")
 
     if base.empty:
         return 0, 0, perioada
