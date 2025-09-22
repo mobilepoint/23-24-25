@@ -1,8 +1,9 @@
 import os
+import io
 import re
 import pandas as pd
 import streamlit as st
-from typing import Optional
+from typing import Optional, Tuple
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from supabase import create_client, Client
@@ -65,7 +66,7 @@ def extract_last_parenthesized(text: str) -> Optional[str]:
     matches = re.findall(r'\(([^()]*)\)', text)
     return matches[-1].strip() if matches else None
 
-# --- utilitare pentru identificare robustă a coloanelor în PROFIT ---
+# --- utilitare pentru identificare robustă a coloanelor în PROFIT (vechiul raport SmartBill) ---
 _norm_tbl = str.maketrans({c: "" for c in " .,_-/%()[]{}:"})
 def norm(s: str) -> str:
     """lower + elimină spații/punctuație (fără diacritice)."""
@@ -170,69 +171,205 @@ def read_full_any(uploaded_file, skiprows: int) -> pd.DataFrame:
         uploaded_file.seek(0)
         return df
 
-# ---------- TAB UPLOAD ----------
+# =========================================================
+# =============== LOADER PROFIT — INTEGRAT =================
+# =========================================================
+
+NUMERIC_RE_THOUSAND_DOT_DECIMAL_COMMA = re.compile(r"^\d{1,3}(\.\d{3})+(,\d+)?$")
+NUMERIC_RE_THOUSAND_COMMA_DECIMAL_DOT = re.compile(r"^\d{1,3}(,\d{3})+(\.\d+)?$")
+
+def _to_number(val) -> Optional[float]:
+    """Convertor robust pentru string-uri numerice RO/EN.
+    Acceptă: 1.021,02  |  1,021.02  |  104,04  |  104.04  |  104
+    Returnează float sau None.
+    """
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if s == "":
+        return None
+    # 1.021,02 (thousand=., decimal=,)
+    if NUMERIC_RE_THOUSAND_DOT_DECIMAL_COMMA.match(s):
+        s = s.replace(".", "").replace(",", ".")
+        return float(s)
+    # 1,021.02 (thousand=,, decimal=.)
+    if NUMERIC_RE_THOUSAND_COMMA_DECIMAL_DOT.match(s):
+        s = s.replace(",", "")
+        return float(s)
+    # doar virgulă -> presupunem decimal=,
+    if "," in s and "." not in s:
+        s = s.replace(",", ".")
+        return float(s)
+    # doar punct -> decimal=.
+    try:
+        return float(s)
+    except Exception:
+        try:
+            return float(s.replace(",", "."))
+        except Exception:
+            return None
+
+def _extract_period_from_profit_header(xls_bytes: bytes) -> date:
+    """Citește rândul 5 col A (ex: 'Perioada: 01/08/2025 - 31/08/2025') și întoarce prima zi a lunii."""
+    head = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, header=None, nrows=8)
+    txt = ""
+    try:
+        txt = str(head.iat[4, 0])
+    except Exception:
+        pass
+    # caută prima dată din text (format dd/mm/yyyy sau dd.mm.yyyy)
+    m = re.search(r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})", txt or "")
+    if not m:
+        # fallback: ultima lună încheiată
+        return last_completed_month(datetime.now(TZ))
+    raw = m.group(1)
+    for fmt in ("%d/%m/%Y", "%d.%m.%Y", "%d-%m-%Y", "%d/%m/%y"):
+        try:
+            d = datetime.strptime(raw, fmt).date()
+            return d.replace(day=1)
+        except Exception:
+            continue
+    # dacă nu reușim, folosim LCM
+    return last_completed_month(datetime.now(TZ))
+
+def _normalize_columns(cols) -> dict:
+    """Returnează un dict {col_original: col_normalizata} și identifică mapping-ul necesar."""
+    norm_map = {}
+    for c in cols:
+        key = (
+            str(c)
+            .lower()
+            .replace("\n", " ")
+            .replace("\r", " ")
+        )
+        key = re.sub(r"[^a-z0-9]+", " ", key)  # doar litere/cifre spații
+        key = re.sub(r"\s+", " ", key).strip()
+        norm_map[c] = key
+    return norm_map
+
+def _extract_sku_from_product(text: str) -> Optional[str]:
+    """SKU este ultimul lucru între paranteze în coloana Produsul."""
+    if not isinstance(text, str):
+        text = str(text)
+    m = re.search(r"\(([^()]+)\)\s*$", text)
+    if m:
+        return m.group(1).strip()
+    return None
+
+def load_profit_file_to_staging(xls_bytes: bytes, expected_period: date) -> Tuple[int, int, date]:
+    """Parsează 'Raport profit pe produs' și scrie în staging.profit_produs.
+    Returnează (rows_in, rows_written, perioada_detectată).
+    """
+    perioada = _extract_period_from_profit_header(xls_bytes)
+
+    # header este pe rândul 11 -> header=10
+    df_raw = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, header=10)
+
+    # elimină coloanele complet goale
+    df_raw = df_raw.loc[:, ~df_raw.columns.to_series().astype(str).str.fullmatch(r"\s*nan\s*", case=False)]
+
+    # renumim ușor pentru matching
+    norm_map = _normalize_columns(df_raw.columns)
+
+    # găsim coloanele necesare după chei 'produsul', 'vanzari nete', 'costul bunurilor vandute'
+    col_prod  = next((c for c in df_raw.columns if norm_map[c] == "produsul"), None)
+    col_net   = next((c for c in df_raw.columns if norm_map[c].startswith("vanzari nete")), None)
+    col_cogs  = next((c for c in df_raw.columns if norm_map[c].startswith("costul bunurilor vandute")), None)
+
+    if not col_prod or not col_net or not col_cogs:
+        raise RuntimeError("Nu am găsit coloanele obligatorii ('Produsul', 'Vanzari nete', 'Costul bunurilor vandute').")
+
+    out = pd.DataFrame({
+        "perioada_luna": perioada,
+        "sku": df_raw[col_prod].apply(_extract_sku_from_product),
+        "net_sales_wo_vat": df_raw[col_net].apply(_to_number),
+        "cogs_wo_vat": df_raw[col_cogs].apply(_to_number),
+    })
+
+    # filtre: fără SKU, fără rânduri complet nule
+    out = out[out["sku"].notna()]
+    out = out[(out["net_sales_wo_vat"].notna()) | (out["cogs_wo_vat"].notna())]
+
+    rows_in = len(out)
+    written = 0
+
+    # Validare lună acceptată
+    if perioada != expected_period:
+        raise RuntimeError(f"Fișierul este pentru {perioada.strftime('%Y-%m')}, dar aici acceptăm doar **{expected_period.strftime('%Y-%m')}**.")
+
+    # inserăm în batch-uri
+    if rows_in:
+        # curățăm valorile NaN -> None pentru JSON
+        out = out.where(pd.notnull(out), None)
+        records = out.to_dict(orient="records")
+        BATCH = 1000
+        try:
+            for i in range(0, len(records), BATCH):
+                chunk = records[i:i+BATCH]
+                # NOTĂ: dacă tabela are coloană ID cu secvență, DB va cere USAGE pe secvență.
+                sb.schema("staging").table("profit_produs").insert(chunk).execute()
+                written += len(chunk)
+        except Exception as e:
+            # Mesaj prietenos pentru permisiuni secvență
+            msg = str(e)
+            if "permission denied for sequence" in msg and "42501" in msg:
+                st.error(
+                    "🔐 Permisiune insuficientă pentru secvența ID din `staging.profit_produs`.\n"
+                    "Soluție (în psql ca superuser):\n"
+                    "  GRANT USAGE, SELECT ON SEQUENCE staging.profit_produs_id_seq TO anon, authenticated;\n"
+                    "sau modifică tabela să NU necesite ID generat (cheie primară compusă: (perioada_luna, sku))."
+                )
+            raise
+
+    return rows_in, written, perioada
+
+# ---------- TAB UPLOAD (unificat: Profit & Mișcări) ----------
 with tab_upload:
     st.subheader("Încarcă fișierul pentru luna acceptată")
-
     file_type = st.radio("Tip fișier", ["Profit pe produs", "Mișcări stocuri"], horizontal=True)
     uploaded_file = st.file_uploader("Alege fișierul Excel/CSV", type=["xlsx", "xls", "csv"])
 
     if uploaded_file is not None:
-        # 1) Citim antetul și detectăm perioada
-        try:
-            head = read_head_any(uploaded_file, nrows=10)
-        except Exception as e:
-            st.error(f"Nu pot citi antetul fișierului: {e}")
-            st.stop()
-
-        period = extract_period_from_header(head)
-        if not period:
-            st.error("Nu am putut detecta perioada din antet (rândul 5). Verifică fișierul.")
-            st.stop()
-
-        st.write(f"📄 **Perioadă detectată:** {period.strftime('%Y-%m')}")
-
-        # 2) Permitem upload doar pentru ultima lună încheiată
-        if period != lcm:
-            st.error(f"Fișierul este pentru {period.strftime('%Y-%m')}, dar aici acceptăm doar **{lcm.strftime('%Y-%m')}**.")
-            st.stop()
-
         rows_json = []
         try:
             if file_type == "Profit pe produs":
-                # 3) Citire full cu fallback (skip primele 10 rânduri; rândul 11 e header)
-                df = read_full_any(uploaded_file, skiprows=10)
+                # citim bytes direct (raportul are header special)
+                data = uploaded_file.read()
+                rows_in, rows_written, period_detected = load_profit_file_to_staging(data, lcm)
+                st.success(f"Import PROFIT OK ({period_detected.strftime('%Y-%m')}). Rânduri parse: {rows_in}, scrise în staging: {rows_written}.")
 
-                # 4) Identificare coloane robustă + fallback la poziții
-                col_prod, col_net, col_cogs = find_profit_columns(df)
-                if col_prod is None or col_net is None or col_cogs is None:
-                    raise ValueError("Nu am reușit să identific coloanele pentru Produs / Vanzari nete / Cost bunuri vandute.")
-
-                # 5) Transformare în JSON pentru RPC
-                for _, r in df.iterrows():
-                    sku = extract_last_parenthesized(r[col_prod])
-                    if not sku:
-                        continue
-                    net_sales = parse_number(r[col_net])
-                    cogs = parse_number(r[col_cogs])
-                    rows_json.append({"sku": sku, "net_sales_wo_vat": net_sales, "cogs_wo_vat": cogs})
-
-                if not rows_json:
-                    raise ValueError("Nu am extras niciun rând valid (SKU).")
-
-                # 6) Apel RPC
-                res = sb.rpc("load_profit_file", {
-                    "p_period": period.isoformat(),
-                    "p_source_path": uploaded_file.name,
-                    "p_rows": rows_json
-                }).execute()
-                st.success(f"Încărcat PROFIT pentru {period.strftime('%Y-%m')}. file_id: {res.data}")
+                # marchează în registry că profitul a fost încărcat (dacă ai un RPC dedicat, îl poți apela aici)
+                try:
+                    sb.rpc("mark_profit_loaded", {"p_period": lcm.isoformat(), "p_source_path": uploaded_file.name}).execute()
+                except Exception:
+                    # dacă nu există RPC-ul, ignorăm
+                    pass
 
             else:  # Mișcări stocuri
-                # 3) Citire full cu fallback (skip primele 9 rânduri; rândul 10 e header)
+                # 1) Citim antetul și detectăm perioada (ca în varianta anterioară)
+                try:
+                    head = read_head_any(uploaded_file, nrows=10)
+                except Exception as e:
+                    st.error(f"Nu pot citi antetul fișierului: {e}")
+                    st.stop()
+
+                period = extract_period_from_header(head)
+                if not period:
+                    st.error("Nu am putut detecta perioada din antet (rândul 5). Verifică fișierul.")
+                    st.stop()
+                st.write(f"📄 **Perioadă detectată:** {period.strftime('%Y-%m')}")
+
+                # Permitem upload doar pentru ultima lună încheiată
+                if period != lcm:
+                    st.error(f"Fișierul este pentru {period.strftime('%Y-%m')}, dar aici acceptăm doar **{lcm.strftime('%Y-%m')}**.")
+                    st.stop()
+
+                # 2) Citire full cu fallback (skip primele 9 rânduri; rândul 10 e header)
                 df = read_full_any(uploaded_file, skiprows=9)
 
-                # 4) Identificare coloane (flexibil, ca în screenshot)
+                # 3) Identificare coloane (flexibil, ca în screenshot)
                 norm_map = {c: norm(c) for c in df.columns}
                 col_sku = next((c for c in df.columns if norm_map[c] in ["cod", "cod1", "sku"]), None)
                 col_qty_open  = next((c for c in df.columns if norm_map[c].startswith("stocinitial")), None)
@@ -251,7 +388,7 @@ with tab_upload:
                 if not all([col_sku, col_qty_open, col_qty_in, col_qty_out, col_qty_close, col_val_open, col_val_in, col_val_out, col_val_close]):
                     raise ValueError("Nu am găsit toate coloanele necesare în mișcări stocuri.")
 
-                # 5) Transformare în JSON pentru RPC
+                # 4) Transformare în JSON pentru RPC
                 for _, r in df.iterrows():
                     sku = str(r[col_sku]).strip()
                     if not sku or sku.lower() in ("nan", "none"):
@@ -271,7 +408,7 @@ with tab_upload:
                 if not rows_json:
                     raise ValueError("Nu am extras niciun rând valid (SKU).")
 
-                # 6) Apel RPC + balanțe
+                # 5) Apel RPC + balanțe
                 res = sb.rpc("load_miscari_file", {
                     "p_period": period.isoformat(),
                     "p_source_path": uploaded_file.name,
@@ -354,7 +491,7 @@ with tab_consol:
                             st.error("Nu pot continua: există încă rânduri în core.fact_* pentru luna curentă. Verifică permisiunile/RLS.")
                             st.stop()
 
-                    # 2) consolidarea tolerantă (nu mai lăsăm funcția să șteargă, am purjat noi)
+                    # 2) consolidarea tolerantă
                     sb.rpc(
                         "consolidate_month_tolerant",
                         {
@@ -374,10 +511,8 @@ with tab_consol:
         st.success("Rapoartele pot fi generate (urmează pagini dedicate: Top sellers, Velocity, Recomandări).")
     else:
         st.warning("Rapoartele sunt blocate până când **ultima lună încheiată** este consolidată.")
+
 # ---------- TAB 🧪 DEBUG BALANȚE ----------
-
-
-
 with tab_debug:
     st.subheader(f"Verifică diferențele de balanță pentru {lcm.strftime('%Y-%m')}")
 
@@ -403,7 +538,8 @@ with tab_debug:
             st.dataframe(ddf, use_container_width=True)
     except Exception as e:
         st.error(f"Eroare la citirea v_balance_*: {e}")
-# ---------- TAB RAPOARTE: Top sellers ----------
+
+# ---------- RAPOARTE: Top sellers ----------
 st.divider()
 st.header("Rapoarte")
 
@@ -443,7 +579,7 @@ with tab_top:
         if df.empty:
             st.info("Nu există date pentru intervalul ales.")
         else:
-            # conversie numerică defensivă (în SQL e numeric, dar poate veni ca text)
+            # conversie numerică defensivă
             for c in ["net_sales_wo_vat", "cogs_wo_vat", "profit_wo_vat", "margin_pct", "qty_sold"]:
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors="coerce")
