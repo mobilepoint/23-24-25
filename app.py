@@ -1,429 +1,328 @@
 import os
-import io
 import re
-from datetime import datetime
-from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
-from supabase import create_client
+from typing import Optional
+from datetime import datetime, date
+from zoneinfo import ZoneInfo
+from supabase import create_client, Client
 
-# =============================================================================
-# Config UI
-# =============================================================================
+# ===================== CONFIG PAGINĂ =====================
 st.set_page_config(page_title="ServicePack Reports", layout="wide")
 st.title("📊 ServicePack Reports")
 
-# =============================================================================
-# Conexiune Supabase
-# =============================================================================
-DEFAULT_SUPABASE_URL = "https://ufpcludvtpfdyjvqjgje.supabase.co"
-DEFAULT_SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-
-SUPABASE_URL = os.getenv("SUPABASE_URL", DEFAULT_SUPABASE_URL)
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", DEFAULT_SUPABASE_KEY)
-
+# ===================== SUPABASE CREDS ====================
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
-    st.error("Lipsesc variabilele **SUPABASE_URL** și/sau **SUPABASE_KEY** (Settings → Secrets).")
+    st.error("❌ Lipsesc SUPABASE_URL / SUPABASE_KEY în Streamlit → Settings → Secrets.")
     st.stop()
 
 try:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    sb = supabase
+    sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
     st.success("Conexiune la Supabase OK.")
 except Exception as e:
     st.error(f"Eroare conectare Supabase: {e}")
     st.stop()
 
-# =============================================================================
-# Helpers business
-# =============================================================================
+# ===================== HELPERI BUSINESS ==================
 TZ = ZoneInfo("Europe/Bucharest")
 
-def last_completed_month(today: datetime) -> datetime.date:
-    """prima zi a lunii precedente în TZ RO"""
+def last_completed_month(today: datetime) -> date:
     first_of_this_month = datetime(today.year, today.month, 1, tzinfo=TZ).date()
-    prev_month_last_day = pd.Timestamp(first_of_this_month) - pd.Timedelta(days=1)
-    return prev_month_last_day.date().replace(day=1)
+    prev_month_last_day = first_of_this_month.replace(day=1) - pd.Timedelta(days=1)
+    return prev_month_last_day.replace(day=1)
 
-now_ro = datetime.now(TZ)
-lcm = last_completed_month(now_ro)
-st.info(f"🗓️ Ultima lună încheiată (pentru încărcare standard): **{lcm.strftime('%Y-%m')}**")
-
-# =============================================================================
-# Utilitare parsing numerice & headere XLS
-# =============================================================================
-NUMERIC_RE_THOUSAND_DOT_DECIMAL_COMMA = re.compile(r"^\d{1,3}(\.\d{3})+(,\d+)?$")
-NUMERIC_RE_THOUSAND_COMMA_DECIMAL_DOT = re.compile(r"^\d{1,3}(,\d{3})+(\.\d+)?$")
-
-def to_number(val):
-    """Tolerant: 1.021,02 | 1,021.02 | 104,04 | 104.04 | 104"""
-    if val is None or (isinstance(val, float) and pd.isna(val)):
+def extract_period_from_header(df_head: pd.DataFrame) -> Optional[date]:
+    """
+    Caută în primele 8-10 rânduri un text de forma:
+    'Perioada: 01/01/2023 - 31/01/2023' și returnează prima zi a lunii.
+    """
+    text = " ".join([" ".join(map(str, row.dropna().astype(str).tolist())) for _, row in df_head.iterrows()])
+    m = re.search(r'(\d{2}/\d{2}/\d{4})\s*-\s*(\d{2}/\d{2}/\d{4})', text)
+    if not m:
         return None
-    if isinstance(val, (int, float)):
-        return float(val)
-    s = str(val).strip()
-    if s == "":
-        return None
-    if NUMERIC_RE_THOUSAND_DOT_DECIMAL_COMMA.match(s):
-        return float(s.replace(".", "").replace(",", "."))
-    if NUMERIC_RE_THOUSAND_COMMA_DECIMAL_DOT.match(s):
-        return float(s.replace(",", ""))
-    if "," in s and "." not in s:
-        return float(s.replace(",", "."))
+    start = pd.to_datetime(m.group(1), dayfirst=True).date()
+    return start.replace(day=1)
+
+def parse_number(x) -> float:
+    """ Acceptă mii cu virgulă și zecimale cu punct. Stringuri goale => 0. """
+    if x is None:
+        return 0.0
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan", "none"):
+        return 0.0
+    s = s.replace(",", "")  # scoate separatorul de mii
     try:
         return float(s)
     except Exception:
-        try:
-            return float(s.replace(",", "."))
-        except Exception:
-            return None
+        return 0.0
 
-def normalize_cols(cols) -> dict:
-    norm = {}
-    for c in cols:
-        key = str(c).lower().replace("\n", " ").replace("\r", " ")
-        key = re.sub(r"[^a-z0-9]+", " ", key)
-        key = re.sub(r"\s+", " ", key).strip()
-        norm[c] = key
-    return norm
+def extract_last_parenthesized(text: str) -> Optional[str]:
+    """Extrage ultimul () din șir -> SKU. Ex: 'Name (X) (SKU-123)' => 'SKU-123'."""
+    if not isinstance(text, str):
+        text = str(text or "")
+    matches = re.findall(r'\(([^()]*)\)', text)
+    return matches[-1].strip() if matches else None
 
-def extract_period_from_header(xls_bytes: bytes, row_idx: int = 4) -> datetime.date:
-    """Din rândul 5 (index 4) col A: 'Perioada: 01/08/2025 - 31/08/2025' -> prima zi a lunii"""
-    head = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, header=None, nrows=row_idx+2)
-    txt = str(head.iat[row_idx, 0]) if head.shape[0] > row_idx else ""
-    m = re.search(r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})", txt or "")
-    if not m:
-        return last_completed_month(datetime.now(TZ))
-    raw = m.group(1)
-    for fmt in ("%d/%m/%Y", "%d.%m.%Y", "%d-%m-%Y", "%d/%m/%y"):
-        try:
-            d = datetime.strptime(raw, fmt).date()
-            return d.replace(day=1)
-        except Exception:
-            continue
-    return last_completed_month(datetime.now(TZ))
+# --- utilitare pentru identificare robustă a coloanelor în PROFIT ---
+_norm_tbl = str.maketrans({c: "" for c in " .,_-/%()[]{}:"})
 
-# =============================================================================
-# UPLOAD & LOADERS
-# =============================================================================
-tab_status, tab_upload, tab_consol, tab_reports = st.tabs(
-    ["🗓️ Status pe luni", "⬆️ Upload fișiere", "✅ Consolidare & Rapoarte", "📊 Rapoarte"]
-)
+def norm(s: str) -> str:
+    """normalizează: lower + elimină spații/punctuație, fără diacritice (presupunem că nu există)."""
+    return str(s).strip().lower().translate(_norm_tbl)
 
-# -------------------- TAB: Status pe luni --------------------
+def find_profit_columns(df: pd.DataFrame):
+    """
+    Caută coloanele pentru:
+      - produs (B)
+      - vânzări nete (E)
+      - cost bunuri vândute (F)
+    Întâi prin nume normalizate, apoi fallback la poziții 1, 4, 5 (0-based).
+    """
+    col_prod = col_net = col_cogs = None
+    ncols = len(df.columns)
+
+    # 1) încercare după nume
+    for c in df.columns:
+        n = norm(c)
+        if col_prod is None and ("produs" in n):
+            col_prod = c
+        if col_net is None and ("vanzari" in n and "nete" in n):
+            col_net = c
+        # acceptăm și forme ca "costul bunurilor vandute", "cost bunuri vandute", "cogs"
+        if col_cogs is None and (("cost" in n and ("bunurilor" in n or "bunuri" in n) and ("vandute" in n or "vandut" in n))
+                                 or n == "cogs" or "cogs" in n):
+            col_cogs = c
+
+    # 2) fallback pe poziții (format fix din raport)
+    if col_prod is None and ncols >= 2:
+        col_prod = df.columns[1]  # B
+    if col_net is None and ncols >= 5:
+        col_net = df.columns[4]   # E
+    if col_cogs is None and ncols >= 6:
+        col_cogs = df.columns[5]  # F
+
+    return col_prod, col_net, col_cogs
+
+# ===================== STATUS BAR ========================
+now_ro = datetime.now(tz=TZ)
+lcm = last_completed_month(now_ro)
+st.info(f"🗓️ Ultima lună încheiată (cerută pentru încărcare standard): **{lcm.strftime('%Y-%m')}**")
+
+# ===================== TABS UI ===========================
+tab_status, tab_upload, tab_consol = st.tabs(["📅 Status pe luni", "⬆️ Upload fișiere", "✅ Consolidare & Rapoarte"])
+
+# ---------- TAB STATUS ----------
 with tab_status:
-    st.subheader("Stare pe luni (ops.period_registry)")
+    st.subheader("Stare pe luni (public.period_registry)")
     try:
-        # dacă schema ops.period_registry nu e expusă, folosim public.period_registry
-        try:
-            resp = supabase.schema("public").table("period_registry").select("*").order("period_month", desc=True).limit(24).execute()
-        except Exception:
-            resp = supabase.table("period_registry").select("*").order("period_month", desc=True).limit(24).execute()
-        df = pd.DataFrame(resp.data or [])
+        resp = sb.table("period_registry").select("*").order("period_month", desc=True).limit(24).execute()
+        df = pd.DataFrame(resp.data)
         if df.empty:
             st.info("Nu există încă înregistrări în period_registry.")
         else:
-            if "period_month" in df.columns:
-                df["period_month"] = pd.to_datetime(df["period_month"]).dt.date
+            df["period_month"] = pd.to_datetime(df["period_month"]).dt.date
             st.dataframe(df, use_container_width=True)
     except Exception as e:
-        st.warning(f"Nu pot citi period_registry: {e}")
+        st.error(f"Nu pot citi period_registry: {e}")
 
-# -------------------- TAB: Upload fișiere --------------------
-with tab_upload:
-    import numpy as np
-
-    st.subheader("📥 Import Raport profit pe produs")
-    up_profit = st.file_uploader(
-        "Alege fișierul XLS/XLSX (formatul standard, rândul 11 = antet)",
-        type=["xls", "xlsx"], key="profit_upload_v2"
-    )
-
-    def extract_sku_from_product(text: str):
-        s = str(text) if text is not None else ""
-        m = re.search(r"\(([^()]+)\)\s*$", s)
-        return m.group(1).strip() if m else None
-
-    def load_profit_file_to_staging(xls_bytes: bytes):
-        perioada = extract_period_from_header(xls_bytes, row_idx=4)
-        df_raw = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, header=10)
-
-        # eliminăm coloane complet goale
-        df_raw = df_raw.loc[:, ~df_raw.columns.to_series().astype(str).str.fullmatch(r"\s*nan\s*", case=False)]
-        norm = normalize_cols(df_raw.columns)
-
-        col_prod = next((c for c in df_raw.columns if norm[c] == "produsul"), None)
-        col_net  = next((c for c in df_raw.columns if norm[c].startswith("vanzari nete")), None)
-        col_cogs = next((c for c in df_raw.columns if norm[c].startswith("costul bunurilor vandute")), None)
-
-        if not col_prod or not col_net or not col_cogs:
-            raise RuntimeError("Nu am găsit coloanele 'Produsul', 'Vanzari nete', 'Costul bunurilor vandute'.")
-
-        out = pd.DataFrame({
-            "perioada_luna": perioada.isoformat(),  # <-- string ISO
-            "sku": df_raw[col_prod].apply(extract_sku_from_product),
-            "net_sales_wo_vat": df_raw[col_net].apply(to_number),
-            "cogs_wo_vat": df_raw[col_cogs].apply(to_number),
-        })
-
-        out = out[out["sku"].notna()]
-        out = out[(out["net_sales_wo_vat"].notna()) | (out["cogs_wo_vat"].notna())]
-        if out.empty:
-            return 0, 0, perioada
-
-        # elimină total orice NaN/NA -> None (JSON-serializable)
-        out = out.replace({pd.NA: None, np.nan: None})
-        out = out.where(pd.notnull(out), None)
-
-        recs = out.to_dict(orient="records")
-        BATCH = 1000
-        written = 0
-        for i in range(0, len(recs), BATCH):
-            sb.schema("staging").table("profit_produs").insert(recs[i:i+BATCH]).execute()
-            written += len(recs[i:i+BATCH])
-
-        return len(out), written, perioada
-
-    if up_profit is not None:
-        try:
-            bytes_profit = up_profit.read()
-            rows_in, rows_out, per = load_profit_file_to_staging(bytes_profit)
-            st.success(f"Import PROFIT OK: parse={rows_in}, scrise={rows_out}, lună={per}.")
-            qsum = (
-                sb.schema("staging").table("profit_produs")
-                  .select("sum(net_sales_wo_vat) as s_net, sum(cogs_wo_vat) as s_cogs")
-                  .eq("perioada_luna", per.isoformat()).execute()
-            )
-            st.caption(f"Sume pentru {per}: {qsum.data}")
-        except Exception as e:
-            st.error(f"Eroare la importul fișierului de profit: {e}")
-
-    st.markdown("---")
-    st.subheader("📥 Import Raport mișcări stocuri")
-    up_stock = st.file_uploader(
-        "Alege fișierul XLS/XLSX (formatul standard, rândul 10 = antet)",
-        type=["xls", "xlsx"], key="stock_upload_v2"
-    )
-
-    def load_stock_file_to_staging(xls_bytes: bytes):
-        perioada = extract_period_from_header(xls_bytes, row_idx=4)  # rândul 5
-        df_raw = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, header=9)  # rândul 10 antet
-
-        # eliminăm coloanele complet goale
-        df_raw = df_raw.loc[:, ~df_raw.columns.to_series().astype(str).str.fullmatch(r"\s*nan\s*", case=False)]
-
-        cols = list(df_raw.columns)
-        norm = normalize_cols(cols)
-
-        # SKU
-        col_sku = next((c for c in cols if norm[c] in ("cod", "sku")), None)
-
-        # Cantități: stoc initial + (intrari, iesiri, stoc final) în bloc
-        col_qty_open = next((c for c in cols if norm[c] == "stoc initial"), None)
-        try:
-            idx_open = cols.index(col_qty_open)
-            col_qty_in = cols[idx_open + 1]
-            col_qty_out = cols[idx_open + 2]
-            col_qty_close = cols[idx_open + 3]
-        except Exception:
-            col_qty_in   = next((c for c in cols if norm[c] == "intrari"), None)
-            col_qty_out  = next((c for c in cols if norm[c] == "iesiri"), None)
-            col_qty_close= next((c for c in cols if norm[c] == "stoc final"), None)
-
-        # Valori: sold initial + (intrari, iesiri, sold final) în bloc
-        col_val_open = next((c for c in cols if norm[c].startswith("sold initial")), None)
-        try:
-            idx_val_open = cols.index(col_val_open)
-            col_val_in = cols[idx_val_open + 1]
-            col_val_out = cols[idx_val_open + 2]
-            col_val_close = cols[idx_val_open + 3]
-        except Exception:
-            col_val_in   = next((c for c in cols if norm[c] == "intrari"), None)
-            col_val_out  = next((c for c in cols if norm[c] == "iesiri"), None)
-            col_val_close= next((c for c in cols if norm[c].startswith("sold final")), None)
-
-        if not all([col_sku, col_qty_open, col_qty_in, col_qty_out, col_qty_close, col_val_open, col_val_in, col_val_out, col_val_close]):
-            raise RuntimeError("Nu am putut detecta setul de coloane pentru mișcări (sku/qty/val).")
-
-        out = pd.DataFrame({
-            "perioada_luna": perioada.isoformat(),  # <-- string ISO
-            "sku": df_raw[col_sku].astype(str).str.strip(),
-            "qty_open":  df_raw[col_qty_open].apply(to_number),
-            "qty_in":    df_raw[col_qty_in].apply(to_number),
-            "qty_out":   df_raw[col_qty_out].apply(to_number),
-            "qty_close": df_raw[col_qty_close].apply(to_number),
-            "val_open":  df_raw[col_val_open].apply(to_number),
-            "val_in":    df_raw[col_val_in].apply(to_number),
-            "val_out":   df_raw[col_val_out].apply(to_number),
-            "val_close": df_raw[col_val_close].apply(to_number),
-        })
-
-        out = out[out["sku"].notna()]
-        # cel puțin una din coloanele cantități/valori are un număr
-        cols_num = ["qty_open","qty_in","qty_out","qty_close","val_open","val_in","val_out","val_close"]
-        out = out[(out[cols_num].notna().any(axis=1))]
-        if out.empty:
-            return 0, 0, perioada
-
-        # elimină total orice NaN/NA -> None (JSON-serializable)
-        out = out.replace({pd.NA: None, np.nan: None})
-        out = out.where(pd.notnull(out), None)
-
-        recs = out.to_dict(orient="records")
-        BATCH = 1000
-        written = 0
-        for i in range(0, len(recs), BATCH):
-            sb.schema("staging").table("miscari_stocuri").insert(recs[i:i+BATCH]).execute()
-            written += len(recs[i:i+BATCH])
-
-        return len(out), written, perioada
-
-    if up_stock is not None:
-        try:
-            bytes_stock = up_stock.read()
-            rows_in, rows_out, per = load_stock_file_to_staging(bytes_stock)
-            st.success(f"Import MIȘCĂRI OK: parse={rows_in}, scrise={rows_out}, lună={per}.")
-            qsum = (
-                sb.schema("staging").table("miscari_stocuri")
-                  .select("sum(qty_out) as s_out, sum(val_out) as v_out")
-                  .eq("perioada_luna", per.isoformat()).execute()
-            )
-            st.caption(f"Sume pentru {per}: {qsum.data}")
-        except Exception as e:
-            st.error(f"Eroare la importul mișcărilor: {e}")
-
-
-
-# -------------------- TAB: Consolidare & Rapoarte --------------------
-with tab_consol:
-    st.subheader(f"Consolidare pentru {lcm.strftime('%Y-%m')}")
-    c1, c2, c3 = st.columns(3)
-    tol_qty = c1.number_input("Toleranță cantități (buc)", min_value=0.0, value=0.01, step=0.01, format="%.2f")
-    tol_val = c2.number_input("Toleranță valori (lei fără TVA)", min_value=0.0, value=5.00, step=0.50, format="%.2f")
-    overwrite = c3.checkbox("Forțează overwrite luna curentă în core/mart", value=True)
-
-    # Semnale simple: există date în staging pentru luna LCM?
+# ---------- TAB UPLOAD ----------
+def read_head_any(uploaded_file, nrows: int) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(uploaded_file, nrows=nrows, header=None)
+        uploaded_file.seek(0)
+        return df
     try:
-        has_profit = supabase.schema("staging").table("profit_produs").select("id", count="exact").eq("perioada_luna", lcm.isoformat()).limit(1).execute().count > 0
-    except Exception:
-        has_profit = False
-    try:
-        has_moves = supabase.schema("staging").table("miscari_stocuri").select("id", count="exact").eq("perioada_luna", lcm.isoformat()).limit(1).execute().count > 0
-    except Exception:
-        has_moves = False
-
-    cols = st.columns(4)
-    cols[0].metric("Profit încărcat?", "DA" if has_profit else "NU")
-    cols[1].metric("Mișcări încărcate?", "DA" if has_moves else "NU")
-
-    # status balanțe (dacă view-ul există)
-    delta_qty = 0.0
-    delta_val = 0.0
-    try:
-        v = supabase.table("v_balance_summary").select("*").eq("period_month", lcm.isoformat()).limit(1).execute().data
-        if v:
-            delta_qty = float(v[0].get("total_diff_qty", 0) or 0)
-            delta_val = float(v[0].get("total_diff_val", 0) or 0)
+        df = pd.read_excel(uploaded_file, nrows=nrows, header=None, engine="openpyxl")
+        uploaded_file.seek(0)
+        return df
     except Exception:
         pass
-    cols[2].metric("Balanță cantități OK?", "DA" if abs(delta_qty) <= tol_qty else "NU", f"Δ {delta_qty:.2f}")
-    cols[3].metric("Balanță valori OK?", "DA" if abs(delta_val) <= tol_val else "NU", f"Δ {delta_val:.2f}")
-
-    st.markdown("")
-
-    do_consol = st.button("🚀 Consolidează luna", use_container_width=False, type="primary", disabled=not (has_profit and has_moves))
-    if do_consol:
-        try:
-            # apel la funcția din DB
-            res = supabase.rpc(
-                "consolidate_month_tolerant",
-                {"p_period": lcm.isoformat(), "p_tol_qty": tol_qty, "p_tol_val": tol_val, "p_overwrite": overwrite},
-            ).execute()
-            st.success("Consolidare reușită. Datele din core/mart au fost reîmprospătate.")
-        except Exception as e:
-            st.error(f"Eroare la consolidare: {e}")
-
-# -------------------- TAB: Rapoarte --------------------
-with tab_reports:
-    st.subheader("🏆 Top sellers (fără TVA)")
-    ytd_start = datetime(datetime.now(TZ).year, 1, 1, tzinfo=TZ).date()
-
-    c1, c2, c3, c4 = st.columns([1.4, 1.2, 1.2, 1])
-    mode   = c1.selectbox("Interval", ["YTD (an curent)", "Ultimele 3 luni", "Ultimele 6 luni", "Custom"], index=0)
-    top_n  = int(c2.number_input("Top N", min_value=5, max_value=300, value=50, step=5))
-    sort_by = c3.selectbox("Sortează după", ["Vânzări nete (lei)", "Profit (lei)", "Cantități vândute (buc)", "Marjă %", "Preț mediu/unitate"], index=0)
-    asc    = c4.checkbox("Crescător", value=False)
-
-    if mode == "YTD (an curent)":
-        start_date, end_date = ytd_start, lcm
-    elif mode == "Ultimele 3 luni":
-        start_date, end_date = (pd.Timestamp(lcm) - pd.offsets.MonthBegin(3)).date(), lcm
-    elif mode == "Ultimele 6 luni":
-        start_date, end_date = (pd.Timestamp(lcm) - pd.offsets.MonthBegin(6)).date(), lcm
-    else:
-        cc1, cc2 = st.columns(2)
-        start_date = cc1.date_input("De la luna", ytd_start)
-        end_date   = cc2.date_input("Până la luna", lcm)
-
     try:
-        resp = sb.table("v_sales_monthly") \
-                 .select("period_month, sku, net_sales_wo_vat, cogs_wo_vat, profit_wo_vat, margin_pct, qty_sold") \
-                 .gte("period_month", start_date.isoformat()) \
-                 .lte("period_month", end_date.isoformat()) \
-                 .execute()
-        df = pd.DataFrame(resp.data or [])
-        if df.empty:
-            st.info("Nu există date pentru intervalul ales.")
+        df = pd.read_excel(uploaded_file, nrows=nrows, header=None, engine="xlrd")
+        uploaded_file.seek(0)
+        return df
+    except Exception:
+        raise RuntimeError("Nu pot citi fișierul: nu este Excel valid (.xlsx/.xls) și nici CSV.")
+
+def read_full_any(uploaded_file, skiprows: int) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(uploaded_file, skiprows=skiprows)
+        uploaded_file.seek(0)
+        return df
+    try:
+        df = pd.read_excel(uploaded_file, skiprows=skiprows, engine="openpyxl")
+        uploaded_file.seek(0)
+        return df
+    except Exception:
+        df = pd.read_excel(uploaded_file, skiprows=skiprows, engine="xlrd")
+        uploaded_file.seek(0)
+        return df
+
+with tab_upload:
+    st.subheader("Încarcă fișierul pentru luna acceptată")
+
+    file_type = st.radio("Tip fișier", ["Profit pe produs", "Mișcări stocuri"], horizontal=True)
+    uploaded_file = st.file_uploader("Alege fișierul Excel/CSV", type=["xlsx", "xls", "csv"])
+
+    if uploaded_file is not None:
+        # 1) Citim antetul și detectăm perioada
+        try:
+            head = read_head_any(uploaded_file, nrows=10)
+        except Exception as e:
+            st.error(f"Nu pot citi antetul fișierului: {e}")
+            st.stop()
+
+        period = extract_period_from_header(head)
+        if not period:
+            st.error("Nu am putut detecta perioada din antet (rândul 5). Verifică fișierul.")
+            st.stop()
+
+        st.write(f"📄 **Perioadă detectată:** {period.strftime('%Y-%m')}")
+
+        # 2) Permitem upload doar pentru ultima lună încheiată
+        if period != lcm:
+            st.error(f"Fișierul este pentru {period.strftime('%Y-%m')}, dar aici acceptăm doar **{lcm.strftime('%Y-%m')}**.")
+            st.stop()
+
+        rows_json = []
+        try:
+            if file_type == "Profit pe produs":
+                # 3) Citire full cu fallback (skip primele 10 rânduri; rândul 11 e header)
+                df = read_full_any(uploaded_file, skiprows=10)
+
+                # 4) Identificare coloane robustă + fallback la poziții
+                col_prod, col_net, col_cogs = find_profit_columns(df)
+                if col_prod is None or col_net is None or col_cogs is None:
+                    raise ValueError("Nu am reușit să identific coloanele pentru Produs / Vanzari nete / Cost bunuri vandute.")
+
+                # 5) Transformare în JSON pentru RPC
+                for _, r in df.iterrows():
+                    sku = extract_last_parenthesized(r[col_prod])
+                    if not sku:
+                        continue
+                    net_sales = parse_number(r[col_net])
+                    cogs = parse_number(r[col_cogs])
+                    rows_json.append({"sku": sku, "net_sales_wo_vat": net_sales, "cogs_wo_vat": cogs})
+
+                if not rows_json:
+                    raise ValueError("Nu am extras niciun rând valid (SKU).")
+
+                # 6) Apel RPC
+                res = sb.rpc("load_profit_file", {
+                    "p_period": period.isoformat(),
+                    "p_source_path": uploaded_file.name,
+                    "p_rows": rows_json
+                }).execute()
+                st.success(f"Încărcat PROFIT pentru {period.strftime('%Y-%m')}. file_id: {res.data}")
+
+            else:  # Mișcări stocuri
+                # 3) Citire full cu fallback (skip primele 9 rânduri; rândul 10 e header)
+                df = read_full_any(uploaded_file, skiprows=9)
+
+                # 4) Identificare coloane (flexibil, ca în screenshot)
+                norm_map = {c: norm(c) for c in df.columns}
+                col_sku = next((c for c in df.columns if norm_map[c] in ["cod", "cod1", "sku"]), None)
+                col_qty_open  = next((c for c in df.columns if norm_map[c].startswith("stocinitial")), None)
+                col_qty_in    = next((c for c in df.columns if norm_map[c] == "intrari"), None)
+                col_qty_out   = next((c for c in df.columns if norm_map[c].startswith("iesiri") and "." not in str(c)), None)
+                col_qty_close = next((c for c in df.columns if norm_map[c].startswith("stocfinal")), None)
+                col_val_open  = next((c for c in df.columns if norm_map[c].startswith("soldinitial")), None)
+                col_val_in    = "Intrari.1" if "Intrari.1" in df.columns else next((c for c in df.columns if norm_map[c]=="intrari" and c != col_qty_in), None)
+                col_val_out   = next((c for c in df.columns if norm_map[c]=="iesiri.1"), None)
+                if not col_val_out:
+                    dup_iesiri = [c for c in df.columns if norm_map[c].startswith("iesiri")]
+                    if len(dup_iesiri) >= 2:
+                        col_val_out = dup_iesiri[1]
+                col_val_close = next((c for c in df.columns if norm_map[c].startswith("soldfinal")), None)
+
+                if not all([col_sku, col_qty_open, col_qty_in, col_qty_out, col_qty_close, col_val_open, col_val_in, col_val_out, col_val_close]):
+                    raise ValueError("Nu am găsit toate coloanele de cantități/valori (Stoc initial/Intrari/Iesiri/Stoc final + Sold initial/Intrari/Iesiri/Sold final).")
+
+                # 5) Transformare în JSON pentru RPC
+                for _, r in df.iterrows():
+                    sku = str(r[col_sku]).strip()
+                    if not sku or sku.lower() in ("nan", "none"):
+                        continue
+                    rows_json.append({
+                        "sku": sku,
+                        "qty_open":  parse_number(r[col_qty_open]),
+                        "qty_in":    parse_number(r[col_qty_in]),
+                        "qty_out":   parse_number(r[col_qty_out]),
+                        "qty_close": parse_number(r[col_qty_close]),
+                        "val_open":  parse_number(r[col_val_open]),
+                        "val_in":    parse_number(r[col_val_in]),
+                        "val_out":   parse_number(r[col_val_out]),
+                        "val_close": parse_number(r[col_val_close]),
+                    })
+
+                if not rows_json:
+                    raise ValueError("Nu am extras niciun rând valid (SKU).")
+
+                # 6) Apel RPC + balanțe
+                res = sb.rpc("load_miscari_file", {
+                    "p_period": period.isoformat(),
+                    "p_source_path": uploaded_file.name,
+                    "p_rows": rows_json
+                }).execute()
+                st.success(f"Încărcat MISCĂRI pentru {period.strftime('%Y-%m')}. file_id: {res.data}")
+
+                sb.rpc("update_balances_for_period", {"p_period": period.isoformat()}).execute()
+                st.info("Balanțele cantități/valori au fost verificate și marcate în registry.")
+
+        except Exception as e:
+            st.error(f"Eroare la procesarea fișierului: {e}")
+
+    st.divider()
+    st.caption("După ce ai încărcat **ambele** fișiere pentru luna acceptată și nu ai erori, folosește tabul „Consolidare & Rapoarte”.")
+
+# ---------- TAB CONSOLIDARE & RAPOARTE ----------
+def get_period_row(sb: Client, period: date) -> Optional[dict]:
+    try:
+        resp = sb.table("period_registry").select("*").eq("period_month", period.isoformat()).execute()
+        rows = resp.data or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+with tab_consol:
+    st.subheader(f"Consolidare pentru {lcm.strftime('%Y-%m')}")
+
+    row = get_period_row(sb, lcm)
+    if not row:
+        st.warning("Nu există încă intrări pentru această lună în registru. Încarcă mai întâi fișierele în tabul „Upload”.")
+    else:
+        cols = st.columns(4)
+        cols[0].metric("Profit încărcat?", "DA" if row.get("profit_loaded") else "NU")
+        cols[1].metric("Mișcări încărcate?", "DA" if row.get("miscari_loaded") else "NU")
+        cols[2].metric("Balanță cantități OK?", "DA" if row.get("balance_ok_qty") else "NU")
+        cols[3].metric("Balanță valori OK?", "DA" if row.get("balance_ok_val") else "NU")
+
+        ready = all([
+            row.get("profit_loaded") is True,
+            row.get("miscari_loaded") is True,
+            row.get("balance_ok_qty") is True,
+            row.get("balance_ok_val") is True,
+        ])
+
+        if row.get("consolidated_to_core"):
+            st.success("✅ Luna este deja consolidată. Rapoartele pot folosi `mart.sales_monthly`.")
+        elif not ready:
+            st.error("Nu poți consolida încă. Asigură-te că ambele fișiere sunt încărcate și balanțele sunt OK.")
         else:
-            # conversii defensive
-            for c in ["net_sales_wo_vat", "cogs_wo_vat", "profit_wo_vat", "margin_pct", "qty_sold"]:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
+            if st.button("🚀 Consolidează luna"):
+                try:
+                    sb.rpc("consolidate_month", {"p_period": lcm.isoformat()}).execute()
+                    st.success("Consolidare reușită. `core.*` a fost suprascris pentru această lună, iar `mart.sales_monthly` a fost reîmprospătat.")
+                except Exception as e:
+                    st.error(f"Eroare la consolidare: {e}")
 
-            ag = (
-                df.groupby("sku", as_index=False)
-                  .agg(
-                      net_sales_wo_vat=("net_sales_wo_vat", "sum"),
-                      cogs_wo_vat=("cogs_wo_vat", "sum"),
-                      profit_wo_vat=("profit_wo_vat", "sum"),
-                      qty_sold=("qty_sold", "sum"),
-                  )
-            )
-            ag["margin_pct"] = (ag["profit_wo_vat"] / ag["net_sales_wo_vat"] * 100).where(ag["net_sales_wo_vat"] != 0)
-            ag["price_per_unit"] = (ag["net_sales_wo_vat"] / ag["qty_sold"]).where(ag["qty_sold"] > 0)
-
-            total_sales = float(ag["net_sales_wo_vat"].sum())
-            total_qty   = float(ag["qty_sold"].sum())
-            ag["sales_share_%"] = (ag["net_sales_wo_vat"] / total_sales * 100).round(2).fillna(0)
-
-            sort_map = {
-                "Vânzări nete (lei)"      : "net_sales_wo_vat",
-                "Profit (lei)"            : "profit_wo_vat",
-                "Cantități vândute (buc)" : "qty_sold",
-                "Marjă %"                 : "margin_pct",
-                "Preț mediu/unitate"      : "price_per_unit",
-            }
-            ag = ag.sort_values(sort_map[sort_by], ascending=asc).head(top_n)
-
-            out = ag.rename(columns={
-                "sku": "SKU",
-                "net_sales_wo_vat": "Vânzări nete (lei)",
-                "cogs_wo_vat": "Cost achiziție (lei)",
-                "profit_wo_vat": "Profit (lei)",
-                "margin_pct": "Marjă %",
-                "qty_sold": "Cantități vândute (buc)",
-                "price_per_unit": "Preț mediu / unitate (lei)",
-                "sales_share_%": "Pondere vânzări %",
-            })
-
-            st.caption(
-                f"Interval: **{start_date} → {end_date}** • Rânduri: {len(out)} • "
-                f"Total vânzări: {total_sales:,.2f} lei • Total buc: {total_qty:,.0f}"
-            )
-            st.dataframe(out, use_container_width=True)
-
-            csv = out.to_csv(index=False).encode("utf-8")
-            st.download_button("📥 Export CSV", data=csv,
-                               file_name=f"top_sellers_{start_date}_{end_date}.csv", mime="text/csv")
-    except Exception as e:
-        st.error(f"Eroare la citire v_sales_monthly: {e}")
+    st.divider()
+    st.subheader("Rapoarte")
+    if row and row.get("consolidated_to_core"):
+        st.success("Rapoartele pot fi generate (urmează pagini dedicate: Top sellers, Velocity, Recomandări).")
+    else:
+        st.warning("Rapoartele sunt blocate până când **ultima lună încheiată** este consolidată.")
