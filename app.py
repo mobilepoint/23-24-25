@@ -243,4 +243,49 @@ with tab_upload:
             st.error(f"Eroare la procesarea fișierului: {e}")
 
 # ---------- CONSOLIDARE + DEBUG (rămân la fel, scurtat pt spațiu) ----------
-# ... restul codului pentru tab_consol și tab_debug rămâne identic ...
+def get_period_row(sb: Client, period: date) -> Optional[dict]:
+    try:
+        resp = sb.table("period_registry").select("*").eq("period_month", period.isoformat()).execute()
+        rows = resp.data or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+with tab_consol:
+    st.subheader(f"Consolidare pentru {lcm.strftime('%Y-%m')}")
+
+    row = get_period_row(sb, lcm)
+    if not row:
+        st.warning("Nu există încă intrări pentru această lună în registru. Încarcă mai întâi fișierele în tabul „Upload”.")
+    else:
+        cols = st.columns(4)
+        cols[0].metric("Profit încărcat?", "DA" if row.get("profit_loaded") else "NU")
+        cols[1].metric("Mișcări încărcate?", "DA" if row.get("miscari_loaded") else "NU")
+        cols[2].metric("Balanță cantități OK?", "DA" if row.get("balance_ok_qty") else "NU")
+        cols[3].metric("Balanță valori OK?", "DA" if row.get("balance_ok_val") else "NU")
+
+        ready = all([
+            row.get("profit_loaded") is True,
+            row.get("miscari_loaded") is True,
+            row.get("balance_ok_qty") is True,
+            row.get("balance_ok_val") is True,
+        ])
+
+        if row.get("consolidated_to_core"):
+            st.success("✅ Luna este deja consolidată. Rapoartele pot folosi `mart.sales_monthly`.")
+        elif not ready:
+            st.error("Nu poți consolida încă. Asigură-te că ambele fișiere sunt încărcate și balanțele sunt OK.")
+        else:
+            if st.button("🚀 Consolidează luna"):
+                try:
+                    sb.rpc("consolidate_month", {"p_period": lcm.isoformat()}).execute()
+                    st.success("Consolidare reușită. `core.*` a fost suprascris pentru această lună, iar `mart.sales_monthly` a fost reîmprospătat.")
+                except Exception as e:
+                    st.error(f"Eroare la consolidare: {e}")
+
+    st.divider()
+    st.subheader("Rapoarte")
+    if row and row.get("consolidated_to_core"):
+        st.success("Rapoartele pot fi generate (urmează pagini dedicate: Top sellers, Velocity, Recomandări).")
+    else:
+        st.warning("Rapoartele sunt blocate până când **ultima lună încheiată** este consolidată.")
