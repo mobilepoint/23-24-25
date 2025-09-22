@@ -154,7 +154,7 @@ with tab_upload:
             raise RuntimeError("Nu am găsit coloanele 'Produsul', 'Vanzari nete', 'Costul bunurilor vandute'.")
 
         out = pd.DataFrame({
-            "perioada_luna": perioada,
+            "perioada_luna": perioada.isoformat(),
             "sku": df_raw[col_prod].apply(extract_sku_from_product),
             "net_sales_wo_vat": df_raw[col_net].apply(to_number),
             "cogs_wo_vat": df_raw[col_cogs].apply(to_number),
@@ -245,7 +245,7 @@ with tab_upload:
             col_val_close = next((c for c in cols if norm[c].startswith("sold final")), None)
 
         out = pd.DataFrame({
-            "perioada_luna": perioada,
+            "perioada_luna": perioada.isoformat(),
             "sku": df_raw[col_sku].astype(str).str.strip(),
             "qty_open":  df_raw[col_qty_open].apply(to_number),
             "qty_in":    df_raw[col_qty_in].apply(to_number),
