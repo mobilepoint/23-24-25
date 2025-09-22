@@ -1,5 +1,4 @@
 import os
-import io
 import re
 import pandas as pd
 import streamlit as st
@@ -35,10 +34,6 @@ def last_completed_month(today: datetime) -> date:
     return prev_month_last_day.replace(day=1)
 
 def extract_period_from_header(df_head: pd.DataFrame) -> Optional[date]:
-    """
-    Caută în primele 8-10 rânduri un text de forma:
-    'Perioada: 01/01/2023 - 31/01/2023' și returnează prima zi a lunii.
-    """
     text = " ".join([" ".join(map(str, row.dropna().astype(str).tolist())) for _, row in df_head.iterrows()])
     m = re.search(r'(\d{2}/\d{2}/\d{4})\s*-\s*(\d{2}/\d{2}/\d{4})', text)
     if not m:
@@ -47,7 +42,6 @@ def extract_period_from_header(df_head: pd.DataFrame) -> Optional[date]:
     return start.replace(day=1)
 
 def parse_number(x) -> float:
-    """ Acceptă mii cu virgulă și zecimale cu punct. Stringuri goale => 0. """
     if x is None:
         return 0.0
     s = str(x).strip()
@@ -60,11 +54,19 @@ def parse_number(x) -> float:
         return 0.0
 
 def extract_last_parenthesized(text: str) -> Optional[str]:
-    """Extrage ultimul () din șir -> SKU. Ex: 'Name (X) (SKU-123)' => 'SKU-123'."""
     if not isinstance(text, str):
         text = str(text or "")
     matches = re.findall(r'\(([^()]*)\)', text)
     return matches[-1].strip() if matches else None
+
+def get_period_row(sb: Client, period: date) -> Optional[dict]:
+    """Citește rândul din public.period_registry pentru perioada dată."""
+    try:
+        resp = sb.table("period_registry").select("*").eq("period_month", period.isoformat()).execute()
+        rows = resp.data or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
 
 # ===================== STATUS BAR ========================
 now_ro = datetime.now(tz=TZ)
@@ -72,7 +74,7 @@ lcm = last_completed_month(now_ro)
 st.info(f"🗓️ Ultima lună încheiată (cerută pentru încărcare standard): **{lcm.strftime('%Y-%m')}**")
 
 # ===================== TABS UI ===========================
-tab_status, tab_upload = st.tabs(["📅 Status pe luni", "⬆️ Upload fișiere"])
+tab_status, tab_upload, tab_consol = st.tabs(["📅 Status pe luni", "⬆️ Upload fișiere", "✅ Consolidare & Rapoarte"])
 
 # ---------- TAB STATUS ----------
 with tab_status:
@@ -186,7 +188,6 @@ with tab_upload:
                 res = sb.rpc("load_miscari_file", {"p_period": period.isoformat(), "p_source_path": uploaded_file.name, "p_rows": rows_json}).execute()
                 st.success(f"Încărcat MISCĂRI pentru {period.strftime('%Y-%m')}. file_id: {res.data}")
 
-                # după upload miscări -> actualizăm balanțele perioadei
                 sb.rpc("update_balances_for_period", {"p_period": period.isoformat()}).execute()
                 st.info("Balanțele cantități/valori au fost verificate și marcate în registry.")
 
@@ -194,4 +195,44 @@ with tab_upload:
             st.error(f"Eroare la procesarea fișierului: {e}")
 
     st.divider()
-    st.caption("După ce ai încărcat **ambele** fișiere pentru luna acceptată și nu ai erori, vom adăuga butonul „Consolidează luna”.")
+    st.caption("După ce ai încărcat **ambele** fișiere pentru luna acceptată și nu ai erori, folosește tabul „Consolidare & Rapoarte”.")
+
+# ---------- TAB CONSOLIDARE & RAPOARTE ----------
+with tab_consol:
+    st.subheader(f"Consolidare pentru {lcm.strftime('%Y-%m')}")
+
+    row = get_period_row(sb, lcm)
+    if not row:
+        st.warning("Nu există încă intrări pentru această lună în registru. Încarcă mai întâi fișierele în tabul „Upload”.")
+    else:
+        cols = st.columns(4)
+        cols[0].metric("Profit încărcat?", "DA" if row.get("profit_loaded") else "NU")
+        cols[1].metric("Mișcări încărcate?", "DA" if row.get("miscari_loaded") else "NU")
+        cols[2].metric("Balanță cantități OK?", "DA" if row.get("balance_ok_qty") else "NU")
+        cols[3].metric("Balanță valori OK?", "DA" if row.get("balance_ok_val") else "NU")
+
+        ready = all([
+            row.get("profit_loaded") is True,
+            row.get("miscari_loaded") is True,
+            row.get("balance_ok_qty") is True,
+            row.get("balance_ok_val") is True,
+        ])
+
+        if row.get("consolidated_to_core"):
+            st.success("✅ Luna este deja consolidată. Rapoartele pot folosi `mart.sales_monthly`.")
+        elif not ready:
+            st.error("Nu poți consolida încă. Asigură-te că ambele fișiere sunt încărcate și balanțele sunt OK.")
+        else:
+            if st.button("🚀 Consolidează luna"):
+                try:
+                    sb.rpc("consolidate_month", {"p_period": lcm.isoformat()}).execute()
+                    st.success("Consolidare reușită. `core.*` a fost suprascris pentru această lună, iar `mart.sales_monthly` a fost reîmprospătat.")
+                except Exception as e:
+                    st.error(f"Eroare la consolidare: {e}")
+
+    st.divider()
+    st.subheader("Rapoarte")
+    if row and row.get("consolidated_to_core"):
+        st.success("Rapoartele pot fi generate (vom adăuga pagini dedicate în pasul următor: Top sellers, Velocity, Recomandări).")
+    else:
+        st.warning("Rapoartele sunt blocate până când **ultima lună încheiată** este consolidată.")
