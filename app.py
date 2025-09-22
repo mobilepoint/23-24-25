@@ -38,19 +38,19 @@ now_ro = datetime.now(tz=TZ)
 lcm = last_completed_month(now_ro)
 st.info(f"🗓️ Ultima lună încheiată (cerută pentru încărcare standard): **{lcm.strftime('%Y-%m')}**")
 
-# ============= CITIRE ops.period_registry =============
-st.subheader("Stare pe luni (ops.period_registry)")
+# ============= CITIRE public.period_registry (VIEW din ops.period_registry) =============
+st.subheader("Stare pe luni (public.period_registry)")
 
 try:
-    resp = sb.schema("ops").table("period_registry").select("*").order("period_month", desc=True).limit(12).execute()
+    resp = sb.table("period_registry").select("*").order("period_month", desc=True).limit(12).execute()
     df = pd.DataFrame(resp.data)
     if df.empty:
-        st.info("Nu există încă înregistrări în ops.period_registry.")
+        st.info("Nu există încă înregistrări în period_registry.")
     else:
         df["period_month"] = pd.to_datetime(df["period_month"]).dt.date
         st.dataframe(df, use_container_width=True)
 except Exception as e:
-    st.error(f"Nu pot citi ops.period_registry: {e}")
+    st.error(f"Nu pot citi period_registry: {e}")
 
 # mesaj final
 st.caption(
