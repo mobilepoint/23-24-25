@@ -288,31 +288,56 @@ with tab_upload:
     st.divider()
     st.caption("După ce ai încărcat **ambele** fișiere pentru luna acceptată și nu ai erori, folosește tabul „Consolidare & Rapoarte”.")
 
-# ---------- TAB CONSOLIDARE & RAPOARTE ----------
+# ---------- TAB CONSOLIDARE & Rapoarte ----------
 with tab_consol:
     st.subheader(f"Consolidare pentru {lcm.strftime('%Y-%m')}")
 
+    # Toleranțe (poți ajusta la nevoie)
+    TOL_QTY = 0.01     # bucăți
+    TOL_VAL = 1.00     # lei fără TVA
+
+    # citim statusul din registry
     row = get_period_row(sb, lcm)
+
+    # citim și rezumatul de balanță din view (pt. toleranțe)
+    sum_resp = sb.table("v_balance_summary").select("*").eq("period_month", lcm.isoformat()).execute()
+    sum_df = pd.DataFrame(sum_resp.data) if sum_resp.data else pd.DataFrame()
+    total_diff_qty = float(sum_df["total_diff_qty"].iloc[0]) if not sum_df.empty else None
+    total_diff_val = float(sum_df["total_diff_val"].iloc[0]) if not sum_df.empty else None
+
     if not row:
         st.warning("Nu există încă intrări pentru această lună în registru. Încarcă mai întâi fișierele în tabul „Upload”.")
     else:
-        cols = st.columns(4)
-        cols[0].metric("Profit încărcat?", "DA" if row.get("profit_loaded") else "NU")
-        cols[1].metric("Mișcări încărcate?", "DA" if row.get("miscari_loaded") else "NU")
-        cols[2].metric("Balanță cantități OK?", "DA" if row.get("balance_ok_qty") else "NU")
-        cols[3].metric("Balanță valori OK?", "DA" if row.get("balance_ok_val") else "NU")
+        # booleene „oficiale”
+        profit_ok  = bool(row.get("profit_loaded"))
+        miscari_ok = bool(row.get("miscari_loaded"))
+        qty_ok_reg = bool(row.get("balance_ok_qty"))
+        val_ok_reg = bool(row.get("balance_ok_val"))
 
-        ready = all([
-            row.get("profit_loaded") is True,
-            row.get("miscari_loaded") is True,
-            row.get("balance_ok_qty") is True,
-            row.get("balance_ok_val") is True,
-        ])
+        # booleene „efective” cu toleranțe
+        qty_ok_eff = qty_ok_reg or (total_diff_qty is not None and abs(total_diff_qty) <= TOL_QTY)
+        val_ok_eff = val_ok_reg or (total_diff_val is not None and abs(total_diff_val) <= TOL_VAL)
+
+        cols = st.columns(4)
+        cols[0].metric("Profit încărcat?", "DA" if profit_ok else "NU")
+        cols[1].metric("Mișcări încărcate?", "DA" if miscari_ok else "NU")
+        cols[2].metric(
+            "Balanță cantități OK?",
+            "DA" if qty_ok_eff else "NU",
+            delta=None if total_diff_qty is None else f"Δ {total_diff_qty:.2f}"
+        )
+        cols[3].metric(
+            "Balanță valori OK?",
+            "DA" if val_ok_eff else "NU",
+            delta=None if total_diff_val is None else f"Δ {total_diff_val:.2f}"
+        )
+
+        ready = all([profit_ok, miscari_ok, qty_ok_eff, val_ok_eff])
 
         if row.get("consolidated_to_core"):
             st.success("✅ Luna este deja consolidată. Rapoartele pot folosi `mart.sales_monthly`.")
         elif not ready:
-            st.error("Nu poți consolida încă. Asigură-te că ambele fișiere sunt încărcate și balanțele sunt OK.")
+            st.error("Nu poți consolida încă. Asigură-te că ambele fișiere sunt încărcate și balanțele sunt în toleranțe.")
         else:
             if st.button("🚀 Consolidează luna"):
                 try:
@@ -323,12 +348,12 @@ with tab_consol:
 
     st.divider()
     st.subheader("Rapoarte")
-    if row and row.get("consolidated_to_core"):
+    if row and (row.get("consolidated_to_core") or ready):
         st.success("Rapoartele pot fi generate (urmează pagini dedicate: Top sellers, Velocity, Recomandări).")
     else:
         st.warning("Rapoartele sunt blocate până când **ultima lună încheiată** este consolidată.")
-
 # ---------- TAB 🧪 DEBUG BALANȚE ----------
+
 with tab_debug:
     st.subheader(f"Verifică diferențele de balanță pentru {lcm.strftime('%Y-%m')}")
 
