@@ -405,3 +405,98 @@ with tab_debug:
             st.dataframe(ddf, use_container_width=True)
     except Exception as e:
         st.error(f"Eroare la citirea v_balance_*: {e}")
+# ---------- TAB RAPOARTE: Top sellers ----------
+st.divider()
+st.header("Rapoarte")
+
+tab_top, tab_velocity, tab_reco = st.tabs(["🏆 Top sellers", "📈 Velocity (în lucru)", "🧠 Recomandări (în lucru)"])
+
+with tab_top:
+    st.subheader("🏆 Top sellers (valoare fără TVA)")
+
+    # intervale rapide
+    now_ro = datetime.now(ZoneInfo("Europe/Bucharest"))
+    lcm = datetime(now_ro.year, now_ro.month, 1, tzinfo=ZoneInfo("Europe/Bucharest")).date()
+    lcm = (pd.Timestamp(lcm) - pd.offsets.Day(1)).date().replace(day=1)  # prima zi din luna precedentă
+
+    ytd_start = datetime(now_ro.year, 1, 1, tzinfo=ZoneInfo("Europe/Bucharest")).date()
+
+    c1, c2, c3, c4 = st.columns([1.4, 1.2, 1.2, 1])
+    mode = c1.selectbox("Interval", ["YTD", "Ultimele 30 zile", "Ultimele 60 zile", "Ultimele 90 zile", "Custom"], index=0)
+    top_n = int(c2.number_input("Top N", min_value=5, max_value=200, value=50, step=5))
+    sort_by = c3.selectbox("Sortează după", ["Vânzări nete", "Profit"], index=0)
+    asc = c4.checkbox("Crescător", value=False)
+
+    if mode == "YTD":
+        start_date = ytd_start
+        end_date = lcm
+    elif mode == "Ultimele 30 zile":
+        start_date = (pd.Timestamp(lcm) - pd.offsets.Day(30)).date().replace(day=1)
+        end_date = lcm
+    elif mode == "Ultimele 60 zile":
+        start_date = (pd.Timestamp(lcm) - pd.offsets.Day(60)).date().replace(day=1)
+        end_date = lcm
+    elif mode == "Ultimele 90 zile":
+        start_date = (pd.Timestamp(lcm) - pd.offsets.Day(90)).date().replace(day=1)
+        end_date = lcm
+    else:
+        cc1, cc2 = st.columns(2)
+        start_date = cc1.date_input("De la luna", ytd_start)
+        end_date   = cc2.date_input("Până la luna", lcm)
+
+    # citire agregată din view publică
+    try:
+        q = (
+            sb.table("v_profit_lunar")
+              .select("period_month, sku, net_sales_wo_vat, cogs_wo_vat, profit_wo_vat, margin_pct")
+              .gte("period_month", start_date.isoformat())
+              .lte("period_month", end_date.isoformat())
+        )
+        data = q.execute().data or []
+        df = pd.DataFrame(data)
+        if df.empty:
+            st.info("Nu există date pentru intervalul ales.")
+        else:
+            df["period_month"] = pd.to_datetime(df["period_month"]).dt.to_period("M").dt.to_timestamp()
+            ag = (
+                df.groupby("sku", as_index=False)
+                  .agg(
+                      net_sales_wo_vat=("net_sales_wo_vat", "sum"),
+                      cogs_wo_vat=("cogs_wo_vat", "sum"),
+                      profit_wo_vat=("profit_wo_vat", "sum"),
+                  )
+            )
+            # recalculăm marja % pe interval
+            ag["margin_pct"] = (ag["profit_wo_vat"] / ag["net_sales_wo_vat"] * 100).where(ag["net_sales_wo_vat"] != 0)
+
+            total_sales = ag["net_sales_wo_vat"].sum()
+            ag["sales_share_%"] = (ag["net_sales_wo_vat"] / total_sales * 100).round(2)
+
+            sort_col = "net_sales_wo_vat" if sort_by == "Vânzări nete" else "profit_wo_vat"
+            ag = ag.sort_values(sort_col, ascending=asc).head(top_n)
+
+            st.caption(f"Interval: **{start_date} → {end_date}**  •  Rânduri: {len(ag)}  •  Total vânzări: {total_sales:,.2f} lei")
+            st.dataframe(
+                ag.rename(columns={
+                    "sku": "SKU",
+                    "net_sales_wo_vat": "Vânzări nete",
+                    "cogs_wo_vat": "COGS",
+                    "profit_wo_vat": "Profit",
+                    "margin_pct": "Marjă %",
+                    "sales_share_%": "Pondere vânzări %",
+                }),
+                use_container_width=True
+            )
+
+            # export
+            csv = ag.to_csv(index=False).encode("utf-8")
+            st.download_button("📥 Export CSV", data=csv, file_name=f"top_sellers_{start_date}_{end_date}.csv", mime="text/csv")
+    except Exception as e:
+        st.error(f"Eroare la citire v_profit_lunar: {e}")
+
+with tab_velocity:
+    st.info("📈 Velocity/rotație va folosi mișcările pe cantități (intrări/ieșiri) după ce stabilim structura finală a fact-urilor de mișcări. În pasul următor adăugăm view-urile necesare.")
+
+with tab_reco:
+    st.info("🧠 Recomandările (ce să cumperi / la ce preț) vor folosi Top sellers + stoc curent + marje țintă. Le activăm imediat după Velocity.")
+# ---------- END RAPOARTE ----------
