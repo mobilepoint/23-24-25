@@ -25,6 +25,152 @@ except Exception as e:
     st.error(f"Eroare conectare Supabase: {e}")
     st.stop()
 
+# ---------- LOAD PROFIT REPORT (Raport profit pe produs) ----------
+import io, re
+from datetime import datetime
+from typing import Optional, Tuple
+
+# dacă nu ai TZ/sb în fișier, asigură-le aici
+try:
+    TZ  # noqa
+except NameError:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo("Europe/Bucharest")
+
+try:
+    sb  # noqa
+except NameError:
+    # presupun că ai deja `supabase = create_client(...)`
+    sb = supabase
+
+# regex-uri pt. recunoașterea numerelor cu separatori
+NUMERIC_RE_THOUSAND_DOT_DECIMAL_COMMA = re.compile(r"^\d{1,3}(\.\d{3})+(,\d+)?$")
+NUMERIC_RE_THOUSAND_COMMA_DECIMAL_DOT = re.compile(r"^\d{1,3}(,\d{3})+(\.\d+)?$")
+
+def _to_number(val) -> Optional[float]:
+    """Convertor tolerant: '1.021,02' | '1,021.02' | '104,04' | '104.04' | 104."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if s == "":
+        return None
+    if NUMERIC_RE_THOUSAND_DOT_DECIMAL_COMMA.match(s):     # 1.021,02
+        return float(s.replace(".", "").replace(",", "."))
+    if NUMERIC_RE_THOUSAND_COMMA_DECIMAL_DOT.match(s):     # 1,021.02
+        return float(s.replace(",", ""))
+    if "," in s and "." not in s:                           # 104,04
+        return float(s.replace(",", "."))
+    try:
+        return float(s)                                     # 104.04
+    except Exception:
+        try:
+            return float(s.replace(",", "."))
+        except Exception:
+            return None
+
+def _extract_period_from_profit_header(xls_bytes: bytes) -> datetime.date:
+    """Citește rândul 5 col A (ex: 'Perioada: 01/08/2025 - 31/08/2025') → prima zi a lunii."""
+    head = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, header=None, nrows=8)
+    txt = str(head.iat[4, 0]) if head.shape[0] >= 5 else ""
+    m = re.search(r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})", txt or "")
+    if not m:
+        # fallback: ultima lună încheiată (definiția din app-ul tău)
+        first_of_this_month = datetime.now(TZ).replace(day=1).date()
+        prev_month_last_day = pd.Timestamp(first_of_this_month) - pd.Timedelta(days=1)
+        return prev_month_last_day.date().replace(day=1)
+    raw = m.group(1)
+    for fmt in ("%d/%m/%Y", "%d.%m.%Y", "%d-%m-%Y", "%d/%m/%y"):
+        try:
+            d = datetime.strptime(raw, fmt).date()
+            return d.replace(day=1)
+        except Exception:
+            continue
+    first_of_this_month = datetime.now(TZ).replace(day=1).date()
+    prev_month_last_day = pd.Timestamp(first_of_this_month) - pd.Timedelta(days=1)
+    return prev_month_last_day.date().replace(day=1)
+
+def _normalize_columns(cols) -> dict:
+    """Map {coloană originală -> cheie normalizată} pt. detecția headere-lor."""
+    norm = {}
+    for c in cols:
+        key = (
+            str(c).lower().replace("\n", " ").replace("\r", " ")
+        )
+        key = re.sub(r"[^a-z0-9]+", " ", key)
+        key = re.sub(r"\s+", " ", key).strip()
+        norm[c] = key
+    return norm
+
+def _extract_sku_from_product(text: str) -> Optional[str]:
+    """SKU = ultimul element între paranteze din 'Produsul' (ne-normalizat)."""
+    s = str(text) if text is not None else ""
+    m = re.search(r"\(([^()]+)\)\s*$", s)
+    return m.group(1).strip() if m else None
+
+def load_profit_file_to_staging(xls_bytes: bytes) -> Tuple[int, int]:
+    """Parsează 'Raport profit pe produs' și inserează în staging.profit_produs."""
+    perioada = _extract_period_from_profit_header(xls_bytes)
+
+    # Header pe rândul 11 -> header=10
+    df_raw = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, header=10)
+
+    # elimină coloane complet goale
+    df_raw = df_raw.loc[:, ~df_raw.columns.to_series().astype(str).str.fullmatch(r"\s*nan\s*", case=False)]
+
+    norm = _normalize_columns(df_raw.columns)
+    # identificăm headerele necesare
+    col_prod = next((c for c in df_raw.columns if norm[c] == "produsul"), None)
+    col_net  = next((c for c in df_raw.columns if norm[c].startswith("vanzari nete")), None)
+    col_cogs = next((c for c in df_raw.columns if norm[c].startswith("costul bunurilor vandute")), None)
+
+    if not col_prod or not col_net or not col_cogs:
+        raise RuntimeError("Nu am găsit coloanele: 'Produsul', 'Vanzari nete', 'Costul bunurilor vandute'.")
+
+    out = pd.DataFrame({
+        "perioada_luna": perioada,
+        "sku": df_raw[col_prod].apply(_extract_sku_from_product),
+        "net_sales_wo_vat": df_raw[col_net].apply(_to_number),
+        "cogs_wo_vat": df_raw[col_cogs].apply(_to_number),
+    })
+
+    # filtrare: avem SKU și cel puțin o valoare
+    out = out[out["sku"].notna()]
+    out = out[(out["net_sales_wo_vat"].notna()) | (out["cogs_wo_vat"].notna())]
+
+    rows_in = len(out)
+    written = 0
+    if rows_in:
+        out = out.where(pd.notnull(out), None)
+        recs = out.to_dict(orient="records")
+        BATCH = 1000
+        for i in range(0, len(recs), BATCH):
+            sb.schema("staging").table("profit_produs").insert(recs[i:i+BATCH]).execute()
+            written += len(recs[i:i+BATCH])
+    return rows_in, written
+
+# UI: card de upload pentru fișierul de profit
+st.subheader("📥 Import Raport profit pe produs")
+profit_file = st.file_uploader("Alege fișierul XLS/XLSX (formatul standard cu rândul 11 = antet).", type=["xls", "xlsx"], key="profit_upload_v2")
+
+if profit_file is not None:
+    try:
+        data = profit_file.read()
+        n_in, n_out = load_profit_file_to_staging(data)
+        st.success(f"Import profit: rânduri parse = {n_in}, scrise în staging = {n_out}.")
+        with st.expander("Verificare rapidă (sumar pe luna importată)"):
+            # îl determinăm din fișier pentru afișaj
+            per = _extract_period_from_profit_header(data)
+            qsum = (
+                sb.schema("staging").table("profit_produs")
+                  .select("sum(net_sales_wo_vat) as s_net, sum(cogs_wo_vat) as s_cogs")
+                  .eq("perioada_luna", per.isoformat())
+                  .execute()
+            )
+            st.write(qsum.data or {})
+    except Exception as e:
+        st.error(f"Eroare la importul fișierului de profit: {e}")
 # ===================== HELPERI BUSINESS ==================
 TZ = ZoneInfo("Europe/Bucharest")
 
