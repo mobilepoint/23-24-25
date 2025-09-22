@@ -34,6 +34,10 @@ def last_completed_month(today: datetime) -> date:
     return prev_month_last_day.replace(day=1)
 
 def extract_period_from_header(df_head: pd.DataFrame) -> Optional[date]:
+    """
+    Caută în primele 8-10 rânduri un text de forma:
+    'Perioada: 01/01/2023 - 31/01/2023' și returnează prima zi a lunii.
+    """
     text = " ".join([" ".join(map(str, row.dropna().astype(str).tolist())) for _, row in df_head.iterrows()])
     m = re.search(r'(\d{2}/\d{2}/\d{4})\s*-\s*(\d{2}/\d{2}/\d{4})', text)
     if not m:
@@ -42,6 +46,7 @@ def extract_period_from_header(df_head: pd.DataFrame) -> Optional[date]:
     return start.replace(day=1)
 
 def parse_number(x) -> float:
+    """ Acceptă mii cu virgulă și zecimale cu punct. Stringuri goale => 0. """
     if x is None:
         return 0.0
     s = str(x).strip()
@@ -54,10 +59,49 @@ def parse_number(x) -> float:
         return 0.0
 
 def extract_last_parenthesized(text: str) -> Optional[str]:
+    """Extrage ultimul () din șir -> SKU. Ex: 'Name (X) (SKU-123)' => 'SKU-123'."""
     if not isinstance(text, str):
         text = str(text or "")
     matches = re.findall(r'\(([^()]*)\)', text)
     return matches[-1].strip() if matches else None
+
+def read_head_any(uploaded_file, nrows: int) -> pd.DataFrame:
+    """Citește primele nrows indiferent dacă e CSV/XLSX/XLS."""
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(uploaded_file, nrows=nrows, header=None)
+        uploaded_file.seek(0)
+        return df
+    # încearcă XLSX cu openpyxl
+    try:
+        df = pd.read_excel(uploaded_file, nrows=nrows, header=None, engine="openpyxl")
+        uploaded_file.seek(0)
+        return df
+    except Exception:
+        pass
+    # încearcă XLS cu xlrd
+    try:
+        df = pd.read_excel(uploaded_file, nrows=nrows, header=None, engine="xlrd")
+        uploaded_file.seek(0)
+        return df
+    except Exception:
+        raise RuntimeError("Nu pot citi fișierul: nu este Excel valid (.xlsx/.xls) și nici CSV.")
+
+def read_full_any(uploaded_file, skiprows: int) -> pd.DataFrame:
+    """Citește întregul fișier cu skiprows pentru header, pentru CSV/XLSX/XLS."""
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(uploaded_file, skiprows=skiprows)
+        uploaded_file.seek(0)
+        return df
+    try:
+        df = pd.read_excel(uploaded_file, skiprows=skiprows, engine="openpyxl")
+        uploaded_file.seek(0)
+        return df
+    except Exception:
+        df = pd.read_excel(uploaded_file, skiprows=skiprows, engine="xlrd")
+        uploaded_file.seek(0)
+        return df
 
 def get_period_row(sb: Client, period: date) -> Optional[dict]:
     """Citește rândul din public.period_registry pentru perioada dată."""
@@ -98,14 +142,9 @@ with tab_upload:
     uploaded_file = st.file_uploader("Alege fișierul Excel/CSV", type=["xlsx", "xls", "csv"])
 
     if uploaded_file is not None:
-        # citim primele 10 rânduri pentru a detecta perioada
+        # 1) Citim antetul și detectăm perioada
         try:
-            if uploaded_file.name.lower().endswith(".csv"):
-                head = pd.read_csv(uploaded_file, nrows=10, header=None)
-                uploaded_file.seek(0)
-            else:
-                head = pd.read_excel(uploaded_file, nrows=10, header=None, engine="openpyxl")
-                uploaded_file.seek(0)
+            head = read_head_any(uploaded_file, nrows=10)
         except Exception as e:
             st.error(f"Nu pot citi antetul fișierului: {e}")
             st.stop()
@@ -117,7 +156,7 @@ with tab_upload:
 
         st.write(f"📄 **Perioadă detectată:** {period.strftime('%Y-%m')}")
 
-        # Permitem upload doar pentru ultima lună încheiată (deocamdată fără backfill)
+        # 2) Permitem upload doar pentru ultima lună încheiată
         if period != lcm:
             st.error(f"Fișierul este pentru {period.strftime('%Y-%m')}, dar aici acceptăm doar **{lcm.strftime('%Y-%m')}**.")
             st.stop()
@@ -125,14 +164,17 @@ with tab_upload:
         rows_json = []
         try:
             if file_type == "Profit pe produs":
-                # skip primele 10 rânduri; rândul 11 e header
-                df = pd.read_excel(uploaded_file, skiprows=10, engine="openpyxl")
+                # 3) Citire full cu fallback (skip primele 10 rânduri; rândul 11 e header)
+                df = read_full_any(uploaded_file, skiprows=10)
+
+                # 4) Identificare coloane
                 col_prod = next((c for c in df.columns if str(c).strip().lower().startswith("produs")), None)
                 col_net  = next((c for c in df.columns if str(c).strip().lower().startswith("vanzari nete")), None)
                 col_cogs = next((c for c in df.columns if str(c).strip().lower().startswith("costul bunurilor")), None)
                 if not all([col_prod, col_net, col_cogs]):
                     raise ValueError("Nu am găsit coloanele 'Produsul', 'Vânzări nete', 'Costul bunurilor vândute'.")
 
+                # 5) Transformare în JSON pentru RPC
                 for _, r in df.iterrows():
                     sku = extract_last_parenthesized(r[col_prod])
                     if not sku:
@@ -144,28 +186,38 @@ with tab_upload:
                 if not rows_json:
                     raise ValueError("Nu am extras niciun rând valid (SKU).")
 
-                res = sb.rpc("load_profit_file", {"p_period": period.isoformat(), "p_source_path": uploaded_file.name, "p_rows": rows_json}).execute()
+                # 6) Apel RPC
+                res = sb.rpc("load_profit_file", {
+                    "p_period": period.isoformat(),
+                    "p_source_path": uploaded_file.name,
+                    "p_rows": rows_json
+                }).execute()
                 st.success(f"Încărcat PROFIT pentru {period.strftime('%Y-%m')}. file_id: {res.data}")
 
             else:  # Mișcări stocuri
-                df = pd.read_excel(uploaded_file, skiprows=9, engine="openpyxl")
-                col_sku = next((c for c in df.columns if str(c).strip().lower() in ["cod", "cod.1", "sku"]), None)
-                col_qty_open = next((c for c in df.columns if str(c).strip().lower().startswith("stoc initial")), None)
-                col_qty_in   = next((c for c in df.columns if str(c).strip().lower() == "intrari"), None)
-                col_qty_out  = next((c for c in df.columns if str(c).strip().lower().startswith("iesiri") and "." not in str(c)), None)
-                col_qty_close= next((c for c in df.columns if str(c).strip().lower().startswith("stoc final")), None)
-                col_val_open = next((c for c in df.columns if str(c).strip().lower().startswith("sold initial")), None)
-                col_val_in   = "Intrari.1" if "Intrari.1" in df.columns else next((c for c in df.columns if str(c).strip().lower()=="intrari" and c != col_qty_in), None)
-                col_val_out  = next((c for c in df.columns if str(c).strip().lower()=="iesiri.1"), None)
+                # 3) Citire full cu fallback (skip primele 9 rânduri; rândul 10 e header)
+                df = read_full_any(uploaded_file, skiprows=9)
+
+                # 4) Identificare coloane (flexibil, ca în screenshot)
+                norm = {c: str(c).strip().lower() for c in df.columns}
+                col_sku = next((c for c in df.columns if norm[c] in ["cod", "cod.1", "sku"]), None)
+                col_qty_open  = next((c for c in df.columns if norm[c].startswith("stoc initial")), None)
+                col_qty_in    = next((c for c in df.columns if norm[c] == "intrari"), None)
+                col_qty_out   = next((c for c in df.columns if norm[c].startswith("iesiri") and "." not in str(c)), None)
+                col_qty_close = next((c for c in df.columns if norm[c].startswith("stoc final")), None)
+                col_val_open  = next((c for c in df.columns if norm[c].startswith("sold initial")), None)
+                col_val_in    = "Intrari.1" if "Intrari.1" in df.columns else next((c for c in df.columns if norm[c]=="intrari" and c != col_qty_in), None)
+                col_val_out   = next((c for c in df.columns if norm[c]=="iesiri.1"), None)
                 if not col_val_out:
-                    dup_iesiri = [c for c in df.columns if str(c).strip().lower().startswith("iesiri")]
+                    dup_iesiri = [c for c in df.columns if norm[c].startswith("iesiri")]
                     if len(dup_iesiri) >= 2:
                         col_val_out = dup_iesiri[1]
-                col_val_close= next((c for c in df.columns if str(c).strip().lower().startswith("sold final")), None)
+                col_val_close = next((c for c in df.columns if norm[c].startswith("sold final")), None)
 
                 if not all([col_sku, col_qty_open, col_qty_in, col_qty_out, col_qty_close, col_val_open, col_val_in, col_val_out, col_val_close]):
                     raise ValueError("Nu am găsit toate coloanele de cantități/valori (Stoc initial/Intrari/Iesiri/Stoc final + Sold initial/Intrari/Iesiri/Sold final).")
 
+                # 5) Transformare în JSON pentru RPC
                 for _, r in df.iterrows():
                     sku = str(r[col_sku]).strip()
                     if not sku or sku.lower() in ("nan", "none"):
@@ -185,7 +237,12 @@ with tab_upload:
                 if not rows_json:
                     raise ValueError("Nu am extras niciun rând valid (SKU).")
 
-                res = sb.rpc("load_miscari_file", {"p_period": period.isoformat(), "p_source_path": uploaded_file.name, "p_rows": rows_json}).execute()
+                # 6) Apel RPC + balanțe
+                res = sb.rpc("load_miscari_file", {
+                    "p_period": period.isoformat(),
+                    "p_source_path": uploaded_file.name,
+                    "p_rows": rows_json
+                }).execute()
                 st.success(f"Încărcat MISCĂRI pentru {period.strftime('%Y-%m')}. file_id: {res.data}")
 
                 sb.rpc("update_balances_for_period", {"p_period": period.isoformat()}).execute()
@@ -233,6 +290,6 @@ with tab_consol:
     st.divider()
     st.subheader("Rapoarte")
     if row and row.get("consolidated_to_core"):
-        st.success("Rapoartele pot fi generate (vom adăuga pagini dedicate în pasul următor: Top sellers, Velocity, Recomandări).")
+        st.success("Rapoartele pot fi generate (urmează pagini dedicate: Top sellers, Velocity, Recomandări).")
     else:
         st.warning("Rapoartele sunt blocate până când **ultima lună încheiată** este consolidată.")
