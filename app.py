@@ -410,37 +410,31 @@ st.header("Rapoarte")
 tab_top, tab_velocity, tab_reco = st.tabs(["🏆 Top sellers", "📈 Velocity (în lucru)", "🧠 Recomandări (în lucru)"])
 
 with tab_top:
-    st.subheader("🏆 Top sellers (valoare fără TVA)")
+    st.subheader("🏆 Top sellers (fără TVA)")
 
-    # ultima lună încheiată (deja calculată mai sus în app ca lcm)
-    # definim intervale rapide
     ytd_start = datetime(datetime.now(TZ).year, 1, 1, tzinfo=TZ).date()
 
     c1, c2, c3, c4 = st.columns([1.4, 1.2, 1.2, 1])
-    mode = c1.selectbox("Interval", ["YTD (an curent)", "Ultimele 3 luni", "Ultimele 6 luni", "Custom"], index=0)
-    top_n = int(c2.number_input("Top N", min_value=5, max_value=300, value=50, step=5))
-    sort_by = c3.selectbox("Sortează după", ["Vânzări nete (lei)", "Profit (lei)", "Marjă %"], index=0)
-    asc = c4.checkbox("Crescător", value=False)
+    mode   = c1.selectbox("Interval", ["YTD (an curent)", "Ultimele 3 luni", "Ultimele 6 luni", "Custom"], index=0)
+    top_n  = int(c2.number_input("Top N", min_value=5, max_value=300, value=50, step=5))
+    sort_by = c3.selectbox("Sortează după", ["Vânzări nete (lei)", "Profit (lei)", "Cantități vândute (buc)", "Marjă %", "Preț mediu/unitate"], index=0)
+    asc    = c4.checkbox("Crescător", value=False)
 
     if mode == "YTD (an curent)":
-        start_date = ytd_start
-        end_date = lcm
+        start_date, end_date = ytd_start, lcm
     elif mode == "Ultimele 3 luni":
-        start_date = (pd.Timestamp(lcm) - pd.offsets.MonthBegin(3)).date()
-        end_date = lcm
+        start_date, end_date = (pd.Timestamp(lcm) - pd.offsets.MonthBegin(3)).date(), lcm
     elif mode == "Ultimele 6 luni":
-        start_date = (pd.Timestamp(lcm) - pd.offsets.MonthBegin(6)).date()
-        end_date = lcm
+        start_date, end_date = (pd.Timestamp(lcm) - pd.offsets.MonthBegin(6)).date(), lcm
     else:
         cc1, cc2 = st.columns(2)
         start_date = cc1.date_input("De la luna", ytd_start)
         end_date   = cc2.date_input("Până la luna", lcm)
 
     try:
-        # citire agregată din view-ul public (face proxy spre core.fact_profit_lunar)
         resp = (
-            sb.table("v_profit_lunar")
-              .select("period_month, sku, net_sales_wo_vat, cogs_wo_vat, profit_wo_vat, margin_pct")
+            sb.table("v_sales_monthly")
+              .select("period_month, sku, net_sales_wo_vat, cogs_wo_vat, profit_wo_vat, margin_pct, qty_sold")
               .gte("period_month", start_date.isoformat())
               .lte("period_month", end_date.isoformat())
               .execute()
@@ -449,56 +443,69 @@ with tab_top:
         if df.empty:
             st.info("Nu există date pentru intervalul ales.")
         else:
+            # conversie numerică defensivă (în SQL e numeric, dar poate veni ca text)
+            for c in ["net_sales_wo_vat", "cogs_wo_vat", "profit_wo_vat", "margin_pct", "qty_sold"]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+
             df["period_month"] = pd.to_datetime(df["period_month"]).dt.to_period("M").dt.to_timestamp()
 
-            # agregare pe SKU în intervalul selectat
+            # agregare pe SKU
             ag = (
                 df.groupby("sku", as_index=False)
                   .agg(
                       net_sales_wo_vat=("net_sales_wo_vat", "sum"),
                       cogs_wo_vat=("cogs_wo_vat", "sum"),
                       profit_wo_vat=("profit_wo_vat", "sum"),
+                      qty_sold=("qty_sold", "sum"),
                   )
             )
-
-            # dacă view-ul nu are profit_wo_vat/margin_pct corecte, recalculez local
-            if "profit_wo_vat" not in ag or ag["profit_wo_vat"].isna().all():
-                ag["profit_wo_vat"] = ag["net_sales_wo_vat"] - ag["cogs_wo_vat"]
-
+            # recalcul marja & preț mediu
             ag["margin_pct"] = (ag["profit_wo_vat"] / ag["net_sales_wo_vat"] * 100).where(ag["net_sales_wo_vat"] != 0)
+            ag["price_per_unit"] = (ag["net_sales_wo_vat"] / ag["qty_sold"]).where(ag["qty_sold"] > 0)
 
             total_sales = float(ag["net_sales_wo_vat"].sum())
+            total_qty   = float(ag["qty_sold"].sum())
             ag["sales_share_%"] = (ag["net_sales_wo_vat"] / total_sales * 100).round(2).fillna(0)
 
-            # sortare
             sort_map = {
-                "Vânzări nete (lei)": "net_sales_wo_vat",
-                "Profit (lei)"      : "profit_wo_vat",
-                "Marjă %"           : "margin_pct",
+                "Vânzări nete (lei)"      : "net_sales_wo_vat",
+                "Profit (lei)"            : "profit_wo_vat",
+                "Cantități vândute (buc)" : "qty_sold",
+                "Marjă %"                 : "margin_pct",
+                "Preț mediu/unitate"      : "price_per_unit",
             }
             ag = ag.sort_values(sort_map[sort_by], ascending=asc).head(top_n)
 
-            # afișare cu denumiri în RO (fără jargon)
             out = ag.rename(columns={
                 "sku": "SKU",
                 "net_sales_wo_vat": "Vânzări nete (lei)",
                 "cogs_wo_vat": "Cost achiziție (lei)",
                 "profit_wo_vat": "Profit (lei)",
                 "margin_pct": "Marjă %",
+                "qty_sold": "Cantități vândute (buc)",
+                "price_per_unit": "Preț mediu / unitate (lei)",
                 "sales_share_%": "Pondere vânzări %",
             })
 
-            st.caption(f"Interval: **{start_date} → {end_date}**  •  Rânduri: {len(out)}  •  Total vânzări: {total_sales:,.2f} lei")
+            st.caption(
+                f"Interval: **{start_date} → {end_date}** • Rânduri: {len(out)} • "
+                f"Total vânzări: {total_sales:,.2f} lei • Total buc: {total_qty:,.0f}"
+            )
             st.dataframe(out, use_container_width=True)
 
-            # export
             csv = out.to_csv(index=False).encode("utf-8")
-            st.download_button("📥 Export CSV", data=csv, file_name=f"top_sellers_{start_date}_{end_date}.csv", mime="text/csv")
+            st.download_button(
+                "📥 Export CSV",
+                data=csv,
+                file_name=f"top_sellers_{start_date}_{end_date}.csv",
+                mime="text/csv"
+            )
     except Exception as e:
-        st.error(f"Eroare la citire v_profit_lunar: {e}")
+        st.error(f"Eroare la citire v_sales_monthly: {e}")
 
 with tab_velocity:
-    st.info("📈 Velocity/rotație va folosi mișcările pe cantități (intrări/ieșiri). Îl adăugăm după ce îți confirmi că Top sellers arată ok.")
+    st.info("📈 Velocity/rotație va folosi mișcările pe cantități (intrări/ieșiri). Îl adăugăm după ce confirmi că Top sellers arată corect.")
 
 with tab_reco:
     st.info("🧠 Recomandările (ce să cumperi / cu cât să vinzi) vor combina Top sellers + stoc curent + ținte de marjă.")
