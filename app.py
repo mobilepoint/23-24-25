@@ -292,9 +292,10 @@ with tab_upload:
 with tab_consol:
     st.subheader(f"Consolidare pentru {lcm.strftime('%Y-%m')}")
 
-    # Toleranțe (poți ajusta la nevoie)
-    TOL_QTY = 0.01     # bucăți
-    TOL_VAL = 1.00     # lei fără TVA
+    c1, c2, c3 = st.columns([1,1,2])
+    TOL_QTY = c1.number_input("Toleranță cantități (buc)", min_value=0.0, value=0.01, step=0.01, format="%.2f")
+    TOL_VAL = c2.number_input("Toleranță valori (lei fără TVA)", min_value=0.0, value=5.00, step=0.10, format="%.2f")
+    overwrite = c3.checkbox("Forțează overwrite luna curentă în core/mart", value=True)
 
     # citim statusul din registry
     row = get_period_row(sb, lcm)
@@ -332,9 +333,6 @@ with tab_consol:
             delta=None if total_diff_val is None else f"Δ {total_diff_val:.2f}"
         )
 
-        # opțiune overwrite (șterge luna din core/mart înainte de consolidare)
-        overwrite = st.checkbox("Forțează overwrite luna curentă în core/mart", value=True)
-
         ready = all([profit_ok, miscari_ok, qty_ok_eff, val_ok_eff])
 
         if row.get("consolidated_to_core"):
@@ -344,7 +342,6 @@ with tab_consol:
         else:
             if st.button("🚀 Consolidează luna"):
                 try:
-                    # apelăm RPC-ul tolerant, cu toleranțele UI + overwrite
                     sb.rpc(
                         "consolidate_month_tolerant",
                         {
@@ -365,6 +362,7 @@ with tab_consol:
     else:
         st.warning("Rapoartele sunt blocate până când **ultima lună încheiată** este consolidată.")
 # ---------- TAB 🧪 DEBUG BALANȚE ----------
+
 
 
 with tab_debug:
