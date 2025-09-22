@@ -292,9 +292,10 @@ with tab_upload:
 with tab_consol:
     st.subheader(f"Consolidare pentru {lcm.strftime('%Y-%m')}")
 
-    # Toleranțe (poți ajusta la nevoie)
-    TOL_QTY = 0.01     # bucăți
-    TOL_VAL = 1.00     # lei fără TVA
+    c1, c2, c3 = st.columns([1,1,2])
+    TOL_QTY = c1.number_input("Toleranță cantități (buc)", min_value=0.0, value=0.01, step=0.01, format="%.2f")
+    TOL_VAL = c2.number_input("Toleranță valori (lei fără TVA)", min_value=0.0, value=5.00, step=0.10, format="%.2f")
+    overwrite = c3.checkbox("Forțează overwrite luna curentă în core/mart", value=True)
 
     # citim statusul din registry
     row = get_period_row(sb, lcm)
@@ -341,12 +342,29 @@ with tab_consol:
         else:
             if st.button("🚀 Consolidează luna"):
                 try:
-                    # apelăm RPC-ul tolerant, cu toleranțele UI
+                    # 1) dacă vrem overwrite, curățăm LUNA din tabelele core (profit + mișcări) în mod verificabil
+                    if overwrite:
+                        purge = sb.rpc("purge_core_month", {"p_period": lcm.isoformat()}).execute()
+                        info = purge.data or {}
+                        st.info(
+                            f"Purge luna → profit: {info.get('profit_before', 0)}→{info.get('profit_after', 0)}, "
+                            f"mișcări: {info.get('miscari_before', 0)}→{info.get('miscari_after', 0)}"
+                        )
+                        if (info.get("profit_after", 0) or 0) > 0 or (info.get("miscari_after", 0) or 0) > 0:
+                            st.error("Nu pot continua: există încă rânduri în core.fact_* pentru luna curentă. Verifică permisiunile/RLS.")
+                            st.stop()
+
+                    # 2) consolidarea tolerantă (nu mai lăsăm funcția să șteargă, am purjat noi)
                     sb.rpc(
                         "consolidate_month_tolerant",
-                        {"p_period": lcm.isoformat(), "p_tol_qty": TOL_QTY, "p_tol_val": TOL_VAL},
+                        {
+                            "p_period": lcm.isoformat(),
+                            "p_tol_qty": TOL_QTY,
+                            "p_tol_val": TOL_VAL,
+                            "p_overwrite": False,
+                        },
                     ).execute()
-                    st.success("Consolidare reușită. `core.*` a fost suprascris pentru această lună, iar `mart.sales_monthly` a fost reîmprospătat.")
+                    st.success("Consolidare reușită. `core.*` a fost suprascris pentru această lună, iar materialized view-urile au fost reîmprospătate (dacă există).")
                 except Exception as e:
                     st.error(f"Eroare la consolidare: {e}")
 
@@ -357,6 +375,7 @@ with tab_consol:
     else:
         st.warning("Rapoartele sunt blocate până când **ultima lună încheiată** este consolidată.")
 # ---------- TAB 🧪 DEBUG BALANȚE ----------
+
 
 
 with tab_debug:
