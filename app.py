@@ -265,60 +265,92 @@ def _extract_sku_from_product(text: str) -> Optional[str]:
     m = re.search(r"\(([^()]+)\)\s*$", text)
     return m.group(1).strip() if m else None
 
-# ---- LOADER PROFIT: FUNCTION (COMPLET) ----
+# ---- LOADER PROFIT: FUNCTION (DATE FIX) ----
 def load_profit_file_to_staging(xls_bytes: bytes, expected_period: date) -> Tuple[int, int, date]:
-    """Parsează 'Raport profit pe produs' și scrie în staging.profit_produs.
-    Returnează (rows_in, rows_written, perioada_detectată).
-    """
     perioada = _extract_period_from_profit_header(xls_bytes)
 
-    # header este pe rândul 11 -> header=10
     df_raw = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, header=10)
-
-    # elimină coloanele complet goale
     df_raw = df_raw.loc[:, ~df_raw.columns.to_series().astype(str).str.fullmatch(r"\s*nan\s*", case=False)]
-
-    # detecție flexibilă a coloanelor
     norm_map = _normalize_columns(df_raw.columns)
 
-    def find_col(keys: list[str]) -> Optional[str]:
-        # întâi egal, apoi "conține"
-        for c in df_raw.columns:
-            if norm_map[c] in keys:
-                return c
-        for c in df_raw.columns:
-            if any(k in norm_map[c] for k in keys):
-                return c
-        return None
-
-    col_prod = find_col(["produsul", "produs"])
-    col_net  = find_col(["vanzari nete", "vanzari nete fara tva", "vanzari nete fara t v a"])
-    col_cogs = find_col(["costul bunurilor vandute", "cost bunurilor vandute", "cogs"])
-
-    # fallback pe poziții tipice SmartBill: B/E/F (0-based 1/4/5)
+    # pick coloane (vezi versiunea robustă data-driven)
+    col_prod = None
+    for c in df_raw.columns:
+        if norm_map[c] in ("produsul", "produs"):
+            col_prod = c
+            break
     if col_prod is None and len(df_raw.columns) >= 2:
         col_prod = df_raw.columns[1]
+
+    # candidați pentru net și cogs
+    def candidates_for(keys_contains: list[str]) -> list[str]:
+        cans = []
+        for c in df_raw.columns:
+            k = norm_map[c]
+            if all(sub in k for sub in keys_contains):
+                cans.append(c)
+        for idx in range(3, min(9, len(df_raw.columns))):
+            cans.append(df_raw.columns[idx])
+        return list(dict.fromkeys(cans))  # unicizează menținând ordinea
+
+    def pick_best_numeric(col_list: list[str]) -> Optional[str]:
+        best_col, best_nonnull, best_sum = None, -1, -1.0
+        for c in col_list:
+            try:
+                s = df_raw[c].apply(_to_number)
+            except Exception:
+                continue
+            nonnull = int(s.notna().sum())
+            total   = float(s.fillna(0).sum())
+            if nonnull > best_nonnull or (nonnull == best_nonnull and total > best_sum):
+                best_col, best_nonnull, best_sum = c, nonnull, total
+        return best_col
+
+    col_net  = pick_best_numeric(candidates_for(["vanzari", "nete"]))
+    col_cogs = pick_best_numeric(candidates_for(["cost", "bunurilor"])) or pick_best_numeric(candidates_for(["cogs"]))
+
     if col_net is None and len(df_raw.columns) >= 5:
         col_net = df_raw.columns[4]
     if col_cogs is None and len(df_raw.columns) >= 6:
         col_cogs = df_raw.columns[5]
 
     if not col_prod or not col_net or not col_cogs:
-        raise RuntimeError(
-            f"Nu găsesc coloanele obligatorii. Detectat: produs={col_prod}, net={col_net}, cogs={col_cogs}. "
-            f"Headere normalizate: {list(norm_map.values())}"
-        )
+        raise RuntimeError("Nu reușesc să identific coloanele pentru Produs / Vânzări nete / Cost bunuri vândute.")
 
+    # --- construim tabelul ---
     out = pd.DataFrame({
-        "perioada_luna": perioada,
+        "perioada_luna": perioada.isoformat(),   # <- FIX: salvăm ca string
         "sku": df_raw[col_prod].apply(_extract_sku_from_product),
         "net_sales_wo_vat": df_raw[col_net].apply(_to_number),
         "cogs_wo_vat": df_raw[col_cogs].apply(_to_number),
     })
 
-    # filtre: fără SKU, fără rânduri complet nule
     out = out[out["sku"].notna()]
     out = out[(out["net_sales_wo_vat"].notna()) | (out["cogs_wo_vat"].notna())]
+
+    # sanity-check
+    sample = out.head(10).copy()
+    st.info(
+        f"Preview import PROFIT: rânduri parse {len(out)}, "
+        f"net≠NULL în sample: {int(sample['net_sales_wo_vat'].notna().sum())}, "
+        f"suma NET total: {float(out['net_sales_wo_vat'].fillna(0).sum()):,.2f}"
+    )
+    st.dataframe(sample, use_container_width=True)
+
+    rows_in, written = len(out), 0
+    if perioada != expected_period:
+        raise RuntimeError(f"Fișierul e pentru {perioada}, dar aici acceptăm doar {expected_period}.")
+
+    if rows_in:
+        out = out.where(pd.notnull(out), None)
+        records = out.to_dict(orient="records")
+        BATCH = 1000
+        for i in range(0, len(records), BATCH):
+            sb.schema("staging").table("profit_produs").insert(records[i:i+BATCH]).execute()
+            written += len(records[i:i+BATCH])
+
+    return rows_in, written, perioada
+# ---- END LOADER PROFIT: FUNCTION (DATE FIX) ----
 
     # --- SANITY CHECK înainte de insert ---
     sample = out.head(10).copy()
