@@ -35,7 +35,7 @@ def last_completed_month(today: datetime) -> date:
 
 def extract_period_from_header(df_head: pd.DataFrame) -> Optional[date]:
     """
-    Caută în primele 8-10 rânduri un text de forma:
+    Caută în primele ~10 rânduri un text de forma:
     'Perioada: 01/01/2023 - 31/01/2023' și returnează prima zi a lunii.
     """
     text = " ".join([" ".join(map(str, row.dropna().astype(str).tolist())) for _, row in df_head.iterrows()])
@@ -67,9 +67,8 @@ def extract_last_parenthesized(text: str) -> Optional[str]:
 
 # --- utilitare pentru identificare robustă a coloanelor în PROFIT ---
 _norm_tbl = str.maketrans({c: "" for c in " .,_-/%()[]{}:"})
-
 def norm(s: str) -> str:
-    """normalizează: lower + elimină spații/punctuație, fără diacritice (presupunem că nu există)."""
+    """lower + elimină spații/punctuație (fără diacritice)."""
     return str(s).strip().lower().translate(_norm_tbl)
 
 def find_profit_columns(df: pd.DataFrame):
@@ -78,21 +77,19 @@ def find_profit_columns(df: pd.DataFrame):
       - produs (B)
       - vânzări nete (E)
       - cost bunuri vândute (F)
-    Întâi prin nume normalizate, apoi fallback la poziții 1, 4, 5 (0-based).
+    Întâi după nume, apoi fallback la poziții 1,4,5 (0-based).
     """
     col_prod = col_net = col_cogs = None
     ncols = len(df.columns)
 
-    # 1) încercare după nume
+    # 1) după nume
     for c in df.columns:
         n = norm(c)
         if col_prod is None and ("produs" in n):
             col_prod = c
         if col_net is None and ("vanzari" in n and "nete" in n):
             col_net = c
-        # acceptăm și forme ca "costul bunurilor vandute", "cost bunuri vandute", "cogs"
-        if col_cogs is None and (("cost" in n and ("bunurilor" in n or "bunuri" in n) and ("vandute" in n or "vandut" in n))
-                                 or n == "cogs" or "cogs" in n):
+        if col_cogs is None and (("cost" in n and ("bunurilor" in n or "bunuri" in n) and ("vandute" in n or "vandut" in n)) or "cogs" in n):
             col_cogs = c
 
     # 2) fallback pe poziții (format fix din raport)
@@ -105,13 +102,24 @@ def find_profit_columns(df: pd.DataFrame):
 
     return col_prod, col_net, col_cogs
 
+def get_period_row(sb: Client, period: date) -> Optional[dict]:
+    """Citește rândul din public.period_registry pentru perioada dată."""
+    try:
+        resp = sb.table("period_registry").select("*").eq("period_month", period.isoformat()).execute()
+        rows = resp.data or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
 # ===================== STATUS BAR ========================
 now_ro = datetime.now(tz=TZ)
 lcm = last_completed_month(now_ro)
 st.info(f"🗓️ Ultima lună încheiată (cerută pentru încărcare standard): **{lcm.strftime('%Y-%m')}**")
 
 # ===================== TABS UI ===========================
-tab_status, tab_upload, tab_consol = st.tabs(["📅 Status pe luni", "⬆️ Upload fișiere", "✅ Consolidare & Rapoarte"])
+tab_status, tab_upload, tab_consol, tab_debug = st.tabs(
+    ["📅 Status pe luni", "⬆️ Upload fișiere", "✅ Consolidare & Rapoarte", "🧪 Debug balanțe"]
+)
 
 # ---------- TAB STATUS ----------
 with tab_status:
@@ -127,7 +135,7 @@ with tab_status:
     except Exception as e:
         st.error(f"Nu pot citi period_registry: {e}")
 
-# ---------- TAB UPLOAD ----------
+# ---------- HELPERE citire fișiere ----------
 def read_head_any(uploaded_file, nrows: int) -> pd.DataFrame:
     name = uploaded_file.name.lower()
     if name.endswith(".csv"):
@@ -162,6 +170,7 @@ def read_full_any(uploaded_file, skiprows: int) -> pd.DataFrame:
         uploaded_file.seek(0)
         return df
 
+# ---------- TAB UPLOAD ----------
 with tab_upload:
     st.subheader("Încarcă fișierul pentru luna acceptată")
 
@@ -240,7 +249,7 @@ with tab_upload:
                 col_val_close = next((c for c in df.columns if norm_map[c].startswith("soldfinal")), None)
 
                 if not all([col_sku, col_qty_open, col_qty_in, col_qty_out, col_qty_close, col_val_open, col_val_in, col_val_out, col_val_close]):
-                    raise ValueError("Nu am găsit toate coloanele de cantități/valori (Stoc initial/Intrari/Iesiri/Stoc final + Sold initial/Intrari/Iesiri/Sold final).")
+                    raise ValueError("Nu am găsit toate coloanele necesare în mișcări stocuri.")
 
                 # 5) Transformare în JSON pentru RPC
                 for _, r in df.iterrows():
@@ -280,14 +289,6 @@ with tab_upload:
     st.caption("După ce ai încărcat **ambele** fișiere pentru luna acceptată și nu ai erori, folosește tabul „Consolidare & Rapoarte”.")
 
 # ---------- TAB CONSOLIDARE & RAPOARTE ----------
-def get_period_row(sb: Client, period: date) -> Optional[dict]:
-    try:
-        resp = sb.table("period_registry").select("*").eq("period_month", period.isoformat()).execute()
-        rows = resp.data or []
-        return rows[0] if rows else None
-    except Exception:
-        return None
-
 with tab_consol:
     st.subheader(f"Consolidare pentru {lcm.strftime('%Y-%m')}")
 
@@ -326,3 +327,30 @@ with tab_consol:
         st.success("Rapoartele pot fi generate (urmează pagini dedicate: Top sellers, Velocity, Recomandări).")
     else:
         st.warning("Rapoartele sunt blocate până când **ultima lună încheiată** este consolidată.")
+
+# ---------- TAB 🧪 DEBUG BALANȚE ----------
+with tab_debug:
+    st.subheader(f"Verifică diferențele de balanță pentru {lcm.strftime('%Y-%m')}")
+
+    try:
+        # Rezumat pe lună
+        s = sb.table("v_balance_summary").select("*").eq("period_month", lcm.isoformat()).execute()
+        sdf = pd.DataFrame(s.data)
+        if not sdf.empty:
+            sdf["period_month"] = pd.to_datetime(sdf["period_month"]).dt.date
+            st.write("**Rezumat:**")
+            st.dataframe(sdf, use_container_width=True)
+        else:
+            st.info("Nu există rezumat pentru această perioadă (posibil să nu fie încărcate mișcările).")
+
+        # Detalii pe SKU
+        d = sb.table("v_balance_issues").select("*").eq("period_month", lcm.isoformat()).limit(10000).execute()
+        ddf = pd.DataFrame(d.data)
+        if ddf.empty:
+            st.success("🎉 Nicio diferență de balanță pe SKU.")
+        else:
+            ddf["period_month"] = pd.to_datetime(ddf["period_month"]).dt.date
+            st.write("**Diferențe pe SKU (abs(diff_qty) > 0.01 sau abs(diff_val) > 0.01):**")
+            st.dataframe(ddf, use_container_width=True)
+    except Exception as e:
+        st.error(f"Eroare la citirea v_balance_*: {e}")
