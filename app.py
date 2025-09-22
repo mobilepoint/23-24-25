@@ -14,7 +14,7 @@ st.title("📊 ServicePack Reports")
 # ===================== SUPABASE CREDS ====================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-if not SUPABASE_URL or not SUPABASE_KEY:
+if not SUPABASE_URL or not SUPABASE_KEY
     st.error("❌ Lipsesc SUPABASE_URL / SUPABASE_KEY în Streamlit → Settings → Secrets.")
     st.stop()
 
@@ -345,12 +345,13 @@ with tab_consol:
                     # 1) dacă vrem overwrite, curățăm luna în mod verificabil
                     if overwrite:
                        purge = sb.rpc("purge_core_month", {"p_period": lcm.isoformat()}).execute()
-                        info = purge.data or {}
-                        st.info(f"Purge luna → profit: {info.get('profit_before')}→{info.get('profit_after')}, "
-                        f"mișcări: {info.get('miscari_before')}→{info.get('miscari_after')}")
-                        if info.get("profit_after", 0) > 0 or info.get("miscari_after", 0) > 0:
-                            st.error("Nu pot continua: există încă rânduri în core.fact_* pentru luna curentă.")
-                            st.stop()
+info = purge.data or {}
+st.info(f"Purge luna → profit: {info.get('profit_before')}→{info.get('profit_after')}, "
+        f"mișcări: {info.get('miscari_before')}→{info.get('miscari_after')}")
+if info.get("profit_after", 0) > 0 or info.get("miscari_after", 0) > 0:
+    st.error("Nu pot continua: există încă rânduri în core.fact_* pentru luna curentă.")
+    st.stop()
+
 
                         info = purge.data or {}
                         before = float(info.get("before", 0))
