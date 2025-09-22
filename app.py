@@ -131,8 +131,13 @@ with tab_status:
 
 # -------------------- TAB: Upload fișiere --------------------
 with tab_upload:
+    import numpy as np
+
     st.subheader("📥 Import Raport profit pe produs")
-    up_profit = st.file_uploader("Alege fișierul XLS/XLSX (formatul standard, rândul 11 = antet)", type=["xls", "xlsx"], key="profit_upload_v2")
+    up_profit = st.file_uploader(
+        "Alege fișierul XLS/XLSX (formatul standard, rândul 11 = antet)",
+        type=["xls", "xlsx"], key="profit_upload_v2"
+    )
 
     def extract_sku_from_product(text: str):
         s = str(text) if text is not None else ""
@@ -142,7 +147,8 @@ with tab_upload:
     def load_profit_file_to_staging(xls_bytes: bytes):
         perioada = extract_period_from_header(xls_bytes, row_idx=4)
         df_raw = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, header=10)
-        # eliminăm coloanele complet goale
+
+        # eliminăm coloane complet goale
         df_raw = df_raw.loc[:, ~df_raw.columns.to_series().astype(str).str.fullmatch(r"\s*nan\s*", case=False)]
         norm = normalize_cols(df_raw.columns)
 
@@ -154,22 +160,26 @@ with tab_upload:
             raise RuntimeError("Nu am găsit coloanele 'Produsul', 'Vanzari nete', 'Costul bunurilor vandute'.")
 
         out = pd.DataFrame({
-            "perioada_luna": perioada.isoformat(),
+            "perioada_luna": perioada.isoformat(),  # <-- string ISO
             "sku": df_raw[col_prod].apply(extract_sku_from_product),
             "net_sales_wo_vat": df_raw[col_net].apply(to_number),
             "cogs_wo_vat": df_raw[col_cogs].apply(to_number),
         })
+
         out = out[out["sku"].notna()]
         out = out[(out["net_sales_wo_vat"].notna()) | (out["cogs_wo_vat"].notna())]
         if out.empty:
-            return 0, 0
+            return 0, 0, perioada
 
+        # elimină total orice NaN/NA -> None (JSON-serializable)
+        out = out.replace({pd.NA: None, np.nan: None})
         out = out.where(pd.notnull(out), None)
+
         recs = out.to_dict(orient="records")
         BATCH = 1000
         written = 0
         for i in range(0, len(recs), BATCH):
-            supabase.schema("staging").table("profit_produs").insert(recs[i:i+BATCH]).execute()
+            sb.schema("staging").table("profit_produs").insert(recs[i:i+BATCH]).execute()
             written += len(recs[i:i+BATCH])
 
         return len(out), written, perioada
@@ -180,9 +190,9 @@ with tab_upload:
             rows_in, rows_out, per = load_profit_file_to_staging(bytes_profit)
             st.success(f"Import PROFIT OK: parse={rows_in}, scrise={rows_out}, lună={per}.")
             qsum = (
-                supabase.schema("staging").table("profit_produs")
-                .select("sum(net_sales_wo_vat) as s_net, sum(cogs_wo_vat) as s_cogs")
-                .eq("perioada_luna", per.isoformat()).execute()
+                sb.schema("staging").table("profit_produs")
+                  .select("sum(net_sales_wo_vat) as s_net, sum(cogs_wo_vat) as s_cogs")
+                  .eq("perioada_luna", per.isoformat()).execute()
             )
             st.caption(f"Sume pentru {per}: {qsum.data}")
         except Exception as e:
@@ -190,62 +200,53 @@ with tab_upload:
 
     st.markdown("---")
     st.subheader("📥 Import Raport mișcări stocuri")
-    up_stock = st.file_uploader("Alege fișierul XLS/XLSX (formatul standard, rândul 10 = antet)", type=["xls", "xlsx"], key="stock_upload_v2")
+    up_stock = st.file_uploader(
+        "Alege fișierul XLS/XLSX (formatul standard, rândul 10 = antet)",
+        type=["xls", "xlsx"], key="stock_upload_v2"
+    )
 
     def load_stock_file_to_staging(xls_bytes: bytes):
         perioada = extract_period_from_header(xls_bytes, row_idx=4)  # rândul 5
         df_raw = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, header=9)  # rândul 10 antet
+
         # eliminăm coloanele complet goale
         df_raw = df_raw.loc[:, ~df_raw.columns.to_series().astype(str).str.fullmatch(r"\s*nan\s*", case=False)]
 
-        # Unele antete sunt duplicate (Intrari/Iesiri la Cantități și la Valori). Le identificăm după poziție.
         cols = list(df_raw.columns)
         norm = normalize_cols(cols)
 
-        # coloane obligatorii
+        # SKU
         col_sku = next((c for c in cols if norm[c] in ("cod", "sku")), None)
-        # Cantități
-        col_qty_open  = next((c for c in cols if norm[c] == "stoc initial"), None)
-        # prima "Intrari" după stoc initial = cantități
+
+        # Cantități: stoc initial + (intrari, iesiri, stoc final) în bloc
+        col_qty_open = next((c for c in cols if norm[c] == "stoc initial"), None)
         try:
             idx_open = cols.index(col_qty_open)
             col_qty_in = cols[idx_open + 1]
             col_qty_out = cols[idx_open + 2]
             col_qty_close = cols[idx_open + 3]
         except Exception:
-            col_qty_in = next((c for c in cols if norm[c] == "intrari"), None)
-            # la nevoie folosim fallback
-            col_qty_out = next((c for c in cols if norm[c] == "iesiri"), None)
-            col_qty_close = next((c for c in cols if norm[c] == "stoc final"), None)
+            col_qty_in   = next((c for c in cols if norm[c] == "intrari"), None)
+            col_qty_out  = next((c for c in cols if norm[c] == "iesiri"), None)
+            col_qty_close= next((c for c in cols if norm[c] == "stoc final"), None)
 
-        # Valori — căutăm al doilea set (după cantități)
-        # găsim "Sold initial" (valoare)
-        col_val_open = None
-        for c in cols:
-            if norm[c] in ("sold initial", "sold initiali", "sold initial "):
-                col_val_open = c
-                break
-        if not col_val_open:
-            # poate e exact "sold initial"
-            col_val_open = next((c for c in cols if norm[c].startswith("sold initial")), None)
-
-        if not all([col_sku, col_qty_open, col_qty_in, col_qty_out, col_qty_close, col_val_open]):
-            raise RuntimeError("Nu am putut detecta setul de coloane pentru mișcări (sku/qty/val).")
-
-        # pe valori, după sold initial urmează intrari/iesiri/sold final
+        # Valori: sold initial + (intrari, iesiri, sold final) în bloc
+        col_val_open = next((c for c in cols if norm[c].startswith("sold initial")), None)
         try:
             idx_val_open = cols.index(col_val_open)
             col_val_in = cols[idx_val_open + 1]
             col_val_out = cols[idx_val_open + 2]
             col_val_close = cols[idx_val_open + 3]
         except Exception:
-            # fallback pe nume
-            col_val_in = next((c for c in cols if norm[c] == "intrari"), None)
-            col_val_out = next((c for c in cols if norm[c] == "iesiri"), None)
-            col_val_close = next((c for c in cols if norm[c].startswith("sold final")), None)
+            col_val_in   = next((c for c in cols if norm[c] == "intrari"), None)
+            col_val_out  = next((c for c in cols if norm[c] == "iesiri"), None)
+            col_val_close= next((c for c in cols if norm[c].startswith("sold final")), None)
+
+        if not all([col_sku, col_qty_open, col_qty_in, col_qty_out, col_qty_close, col_val_open, col_val_in, col_val_out, col_val_close]):
+            raise RuntimeError("Nu am putut detecta setul de coloane pentru mișcări (sku/qty/val).")
 
         out = pd.DataFrame({
-            "perioada_luna": perioada.isoformat(),
+            "perioada_luna": perioada.isoformat(),  # <-- string ISO
             "sku": df_raw[col_sku].astype(str).str.strip(),
             "qty_open":  df_raw[col_qty_open].apply(to_number),
             "qty_in":    df_raw[col_qty_in].apply(to_number),
@@ -258,16 +259,21 @@ with tab_upload:
         })
 
         out = out[out["sku"].notna()]
-        out = out[(out[["qty_open","qty_in","qty_out","qty_close","val_open","val_in","val_out","val_close"]].notna().any(axis=1))]
+        # cel puțin una din coloanele cantități/valori are un număr
+        cols_num = ["qty_open","qty_in","qty_out","qty_close","val_open","val_in","val_out","val_close"]
+        out = out[(out[cols_num].notna().any(axis=1))]
         if out.empty:
-            return 0, 0
+            return 0, 0, perioada
 
+        # elimină total orice NaN/NA -> None (JSON-serializable)
+        out = out.replace({pd.NA: None, np.nan: None})
         out = out.where(pd.notnull(out), None)
+
         recs = out.to_dict(orient="records")
         BATCH = 1000
         written = 0
         for i in range(0, len(recs), BATCH):
-            supabase.schema("staging").table("miscari_stocuri").insert(recs[i:i+BATCH]).execute()
+            sb.schema("staging").table("miscari_stocuri").insert(recs[i:i+BATCH]).execute()
             written += len(recs[i:i+BATCH])
 
         return len(out), written, perioada
@@ -278,13 +284,15 @@ with tab_upload:
             rows_in, rows_out, per = load_stock_file_to_staging(bytes_stock)
             st.success(f"Import MIȘCĂRI OK: parse={rows_in}, scrise={rows_out}, lună={per}.")
             qsum = (
-                supabase.schema("staging").table("miscari_stocuri")
-                .select("sum(qty_out) as s_out, sum(val_out) as v_out")
-                .eq("perioada_luna", per.isoformat()).execute()
+                sb.schema("staging").table("miscari_stocuri")
+                  .select("sum(qty_out) as s_out, sum(val_out) as v_out")
+                  .eq("perioada_luna", per.isoformat()).execute()
             )
             st.caption(f"Sume pentru {per}: {qsum.data}")
         except Exception as e:
             st.error(f"Eroare la importul mișcărilor: {e}")
+
+
 
 # -------------------- TAB: Consolidare & Rapoarte --------------------
 with tab_consol:
