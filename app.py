@@ -52,4 +52,8 @@ try:
 except Exception as e:
     st.error(f"Nu pot citi ops.period_registry: {e}")
 
-st.caption("Hint: după ce încărcăm fișierele pe luna afișată mai sus și trecem validările, vom activa butonul
+# mesaj final
+st.caption(
+    "Hint: după ce încărcăm fișierele pe luna afișată mai sus și trecem validările, "
+    "vom activa butonul de consolidare în pașii următori."
+)
