@@ -3,7 +3,8 @@ import io
 import re
 import pandas as pd
 import streamlit as st
-from datetime import datetime
+from typing import Optional
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from supabase import create_client, Client
 
@@ -28,17 +29,17 @@ except Exception as e:
 # ===================== HELPERI BUSINESS ==================
 TZ = ZoneInfo("Europe/Bucharest")
 
-def last_completed_month(today: datetime) -> datetime.date:
+def last_completed_month(today: datetime) -> date:
     first_of_this_month = datetime(today.year, today.month, 1, tzinfo=TZ).date()
     prev_month_last_day = first_of_this_month.replace(day=1) - pd.Timedelta(days=1)
     return prev_month_last_day.replace(day=1)
 
-def extract_period_from_header(df_head: pd.DataFrame) -> datetime.date | None:
+def extract_period_from_header(df_head: pd.DataFrame) -> Optional[date]:
     """
     Caută în primele 8-10 rânduri un text de forma:
     'Perioada: 01/01/2023 - 31/01/2023' și returnează prima zi a lunii.
     """
-    text = " ".join([ " ".join(map(str, row.dropna().astype(str).tolist())) for _, row in df_head.iterrows() ])
+    text = " ".join([" ".join(map(str, row.dropna().astype(str).tolist())) for _, row in df_head.iterrows()])
     m = re.search(r'(\d{2}/\d{2}/\d{4})\s*-\s*(\d{2}/\d{2}/\d{4})', text)
     if not m:
         return None
@@ -52,14 +53,13 @@ def parse_number(x) -> float:
     s = str(x).strip()
     if s == "" or s.lower() in ("nan", "none"):
         return 0.0
-    # scoate separatorul de mii ','
-    s = s.replace(",", "")
+    s = s.replace(",", "")  # scoate separatorul de mii
     try:
         return float(s)
     except Exception:
         return 0.0
 
-def extract_last_parenthesized(text: str) -> str | None:
+def extract_last_parenthesized(text: str) -> Optional[str]:
     """Extrage ultimul () din șir -> SKU. Ex: 'Name (X) (SKU-123)' => 'SKU-123'."""
     if not isinstance(text, str):
         text = str(text or "")
@@ -120,13 +120,11 @@ with tab_upload:
             st.error(f"Fișierul este pentru {period.strftime('%Y-%m')}, dar aici acceptăm doar **{lcm.strftime('%Y-%m')}**.")
             st.stop()
 
-        # Parsare efectivă în funcție de tip
         rows_json = []
         try:
             if file_type == "Profit pe produs":
                 # skip primele 10 rânduri; rândul 11 e header
                 df = pd.read_excel(uploaded_file, skiprows=10, engine="openpyxl")
-                # Găsim coloanele relevante (numele pot varia puțin; căutăm prin prefix)
                 col_prod = next((c for c in df.columns if str(c).strip().lower().startswith("produs")), None)
                 col_net  = next((c for c in df.columns if str(c).strip().lower().startswith("vanzari nete")), None)
                 col_cogs = next((c for c in df.columns if str(c).strip().lower().startswith("costul bunurilor")), None)
@@ -144,36 +142,26 @@ with tab_upload:
                 if not rows_json:
                     raise ValueError("Nu am extras niciun rând valid (SKU).")
 
-                # apel RPC public
                 res = sb.rpc("load_profit_file", {"p_period": period.isoformat(), "p_source_path": uploaded_file.name, "p_rows": rows_json}).execute()
                 st.success(f"Încărcat PROFIT pentru {period.strftime('%Y-%m')}. file_id: {res.data}")
 
             else:  # Mișcări stocuri
                 df = pd.read_excel(uploaded_file, skiprows=9, engine="openpyxl")
-                # Coloane prin căutare flexibilă:
                 col_sku = next((c for c in df.columns if str(c).strip().lower() in ["cod", "cod.1", "sku"]), None)
                 col_qty_open = next((c for c in df.columns if str(c).strip().lower().startswith("stoc initial")), None)
                 col_qty_in   = next((c for c in df.columns if str(c).strip().lower() == "intrari"), None)
-                # pentru 'Intrari' apar două; prima e la cantități, a doua la valori -> identificăm și celelalte câmpuri
-                # fallback pe poziții dacă nu găsim ușor
-                if not col_sku:
-                    raise ValueError("Nu am găsit coloana 'Cod' (SKU).")
-
-                # Heuristic: presupunem schema ca în screenshot (E..H cantități, I..L valori)
-                # Dacă df are duplicate 'Intrari', pandas le denumește 'Intrari' și 'Intrari.1'
                 col_qty_out  = next((c for c in df.columns if str(c).strip().lower().startswith("iesiri") and "." not in str(c)), None)
                 col_qty_close= next((c for c in df.columns if str(c).strip().lower().startswith("stoc final")), None)
                 col_val_open = next((c for c in df.columns if str(c).strip().lower().startswith("sold initial")), None)
                 col_val_in   = "Intrari.1" if "Intrari.1" in df.columns else next((c for c in df.columns if str(c).strip().lower()=="intrari" and c != col_qty_in), None)
                 col_val_out  = next((c for c in df.columns if str(c).strip().lower()=="iesiri.1"), None)
                 if not col_val_out:
-                    # poate fi "Iesiri" duplicat -> găsim al doilea
                     dup_iesiri = [c for c in df.columns if str(c).strip().lower().startswith("iesiri")]
                     if len(dup_iesiri) >= 2:
                         col_val_out = dup_iesiri[1]
                 col_val_close= next((c for c in df.columns if str(c).strip().lower().startswith("sold final")), None)
 
-                if not all([col_qty_open, col_qty_in, col_qty_out, col_qty_close, col_val_open, col_val_in, col_val_out, col_val_close]):
+                if not all([col_sku, col_qty_open, col_qty_in, col_qty_out, col_qty_close, col_val_open, col_val_in, col_val_out, col_val_close]):
                     raise ValueError("Nu am găsit toate coloanele de cantități/valori (Stoc initial/Intrari/Iesiri/Stoc final + Sold initial/Intrari/Iesiri/Sold final).")
 
                 for _, r in df.iterrows():
