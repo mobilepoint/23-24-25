@@ -344,7 +344,14 @@ with tab_consol:
                 try:
                     # 1) dacă vrem overwrite, curățăm luna în mod verificabil
                     if overwrite:
-                        purge = sb.rpc("purge_core_profit_month", {"p_period": lcm.isoformat()}).execute()
+                       purge = sb.rpc("purge_core_month", {"p_period": lcm.isoformat()}).execute()
+                        info = purge.data or {}
+                        st.info(f"Purge luna → profit: {info.get('profit_before')}→{info.get('profit_after')}, "
+                        f"mișcări: {info.get('miscari_before')}→{info.get('miscari_after')}")
+                        if info.get("profit_after", 0) > 0 or info.get("miscari_after", 0) > 0:
+                            st.error("Nu pot continua: există încă rânduri în core.fact_* pentru luna curentă.")
+                            st.stop()
+
                         info = purge.data or {}
                         before = float(info.get("before", 0))
                         after  = float(info.get("after", 0))
