@@ -342,16 +342,28 @@ with tab_consol:
         else:
             if st.button("🚀 Consolidează luna"):
                 try:
+                    # 1) dacă vrem overwrite, curățăm luna în mod verificabil
+                    if overwrite:
+                        purge = sb.rpc("purge_core_profit_month", {"p_period": lcm.isoformat()}).execute()
+                        info = purge.data or {}
+                        before = float(info.get("before", 0))
+                        after  = float(info.get("after", 0))
+                        st.info(f"Purge fact_profit_lunar → înainte: {int(before)}, după: {int(after)}")
+                        if after > 0:
+                            st.error("Nu pot continua: există încă rânduri în core.fact_profit_lunar pentru luna curentă. Verifică permisiunile/RLS.")
+                            st.stop()
+
+                    # 2) consolidarea tolerantă
                     sb.rpc(
                         "consolidate_month_tolerant",
                         {
                             "p_period": lcm.isoformat(),
                             "p_tol_qty": TOL_QTY,
                             "p_tol_val": TOL_VAL,
-                            "p_overwrite": overwrite,
+                            "p_overwrite": False,  # deja am făcut purge explicit, nu mai ștergem aici
                         },
                     ).execute()
-                    st.success("Consolidare reușită. `core.*` a fost suprascris pentru această lună, iar `mart.sales_monthly` a fost reîmprospătat.")
+                    st.success("Consolidare reușită. `core.*` a fost suprascris pentru această lună, iar materialized view-urile au fost reîmprospătate (dacă există).")
                 except Exception as e:
                     st.error(f"Eroare la consolidare: {e}")
 
@@ -362,6 +374,7 @@ with tab_consol:
     else:
         st.warning("Rapoartele sunt blocate până când **ultima lună încheiată** este consolidată.")
 # ---------- TAB 🧪 DEBUG BALANȚE ----------
+
 
 
 
