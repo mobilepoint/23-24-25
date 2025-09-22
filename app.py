@@ -332,6 +332,9 @@ with tab_consol:
             delta=None if total_diff_val is None else f"Δ {total_diff_val:.2f}"
         )
 
+        # opțiune overwrite (șterge luna din core/mart înainte de consolidare)
+        overwrite = st.checkbox("Forțează overwrite luna curentă în core/mart", value=True)
+
         ready = all([profit_ok, miscari_ok, qty_ok_eff, val_ok_eff])
 
         if row.get("consolidated_to_core"):
@@ -341,10 +344,15 @@ with tab_consol:
         else:
             if st.button("🚀 Consolidează luna"):
                 try:
-                    # apelăm RPC-ul tolerant, cu toleranțele UI
+                    # apelăm RPC-ul tolerant, cu toleranțele UI + overwrite
                     sb.rpc(
                         "consolidate_month_tolerant",
-                        {"p_period": lcm.isoformat(), "p_tol_qty": TOL_QTY, "p_tol_val": TOL_VAL},
+                        {
+                            "p_period": lcm.isoformat(),
+                            "p_tol_qty": TOL_QTY,
+                            "p_tol_val": TOL_VAL,
+                            "p_overwrite": overwrite,
+                        },
                     ).execute()
                     st.success("Consolidare reușită. `core.*` a fost suprascris pentru această lună, iar `mart.sales_monthly` a fost reîmprospătat.")
                 except Exception as e:
@@ -357,6 +365,7 @@ with tab_consol:
     else:
         st.warning("Rapoartele sunt blocate până când **ultima lună încheiată** este consolidată.")
 # ---------- TAB 🧪 DEBUG BALANȚE ----------
+
 
 with tab_debug:
     st.subheader(f"Verifică diferențele de balanță pentru {lcm.strftime('%Y-%m')}")
