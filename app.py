@@ -14,7 +14,7 @@ st.title("📊 ServicePack Reports")
 # ===================== SUPABASE CREDS ====================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-if not SUPABASE_URL or not SUPABASE_KEY
+if not SUPABASE_URL or not SUPABASE_KEY:
     st.error("❌ Lipsesc SUPABASE_URL / SUPABASE_KEY în Streamlit → Settings → Secrets.")
     st.stop()
 
