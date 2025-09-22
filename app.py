@@ -341,7 +341,11 @@ with tab_consol:
         else:
             if st.button("🚀 Consolidează luna"):
                 try:
-                    sb.rpc("consolidate_month", {"p_period": lcm.isoformat()}).execute()
+                    # apelăm RPC-ul tolerant, cu toleranțele UI
+                    sb.rpc(
+                        "consolidate_month_tolerant",
+                        {"p_period": lcm.isoformat(), "p_tol_qty": TOL_QTY, "p_tol_val": TOL_VAL},
+                    ).execute()
                     st.success("Consolidare reușită. `core.*` a fost suprascris pentru această lună, iar `mart.sales_monthly` a fost reîmprospătat.")
                 except Exception as e:
                     st.error(f"Eroare la consolidare: {e}")
@@ -353,6 +357,7 @@ with tab_consol:
     else:
         st.warning("Rapoartele sunt blocate până când **ultima lună încheiată** este consolidată.")
 # ---------- TAB 🧪 DEBUG BALANȚE ----------
+
 
 with tab_debug:
     st.subheader(f"Verifică diferențele de balanță pentru {lcm.strftime('%Y-%m')}")
