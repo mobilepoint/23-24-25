@@ -336,3 +336,173 @@ with tab_debug:
     except Exception as e:
         st.error(f"Eroare la citirea staging: {e}")
 # ---- END APP.PY ----
+# ---- PATCH: folosește explicit schema "staging" pentru raw & products ----
+
+def _ensure_products_from_profit(sb: Client, rows: list[dict]) -> int:
+    """
+    Dacă SKU există deja în staging.products -> îl ignorăm.
+    Dacă NU există -> îl inserăm cu numele extras din fișierul de profit.
+    """
+    def _extract_product_name(product_text: str) -> str:
+        if not isinstance(product_text, str):
+            product_text = str(product_text or "")
+        m = re.search(r"\s*\([^()]*\)\s*$", product_text)
+        return product_text[:m.start()].strip() if m else product_text.strip()
+
+    candidates = {}
+    for r in rows:
+        sku = (str(r.get("sku") or "").strip().upper())
+        if not sku:
+            continue
+        if sku not in candidates:
+            name = _extract_product_name(r.get("product_text"))
+            candidates[sku] = name
+
+    if not candidates:
+        return 0
+
+    sku_list = list(candidates.keys())
+
+    # Citește EXISTENTELE din staging.products
+    existing = set()
+    try:
+        CH = 1000
+        for i in range(0, len(sku_list), CH):
+            part = sku_list[i:i+CH]
+            resp = (
+                sb.schema("staging")
+                  .table("products")
+                  .select("sku")
+                  .in_("sku", part)
+                  .execute()
+            )
+            for row in (resp.data or []):
+                existing.add((row.get("sku") or "").upper())
+    except Exception:
+        pass
+
+    to_insert = [{"sku": sku, "name": candidates[sku]} for sku in sku_list if sku not in existing]
+    if not to_insert:
+        return 0
+
+    # INSERĂ în staging.products
+    sb.schema("staging").table("products").insert(to_insert).execute()
+    return len(to_insert)
+
+
+def load_raw_profit_to_catalog(xls_bytes: bytes, expected_period: date, source_path: str) -> Tuple[int, int, date]:
+    """
+    Încarcă raportul de profit în staging.raw_profit + completează staging.products.
+    """
+    perioada = _extract_period_from_profit_header(xls_bytes)
+
+    df_raw = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, header=10)
+    df_raw = df_raw.loc[:, ~df_raw.columns.to_series().astype(str).str.fullmatch(r"\s*nan\s*", case=False)]
+    norm_map = _normalize_columns(df_raw.columns)
+
+    col_prod = next((c for c in df_raw.columns if norm_map[c] in ("produsul", "produs")), None)
+    if col_prod is None and len(df_raw.columns) >= 2:
+        col_prod = df_raw.columns[1]
+
+    # fallback pe pozițiile clasice (E/F)
+    col_net  = df_raw.columns[4]
+    col_cogs = df_raw.columns[5]
+
+    df_reset = df_raw.reset_index(drop=True)
+    base = pd.DataFrame({
+        "row_number": (df_reset.index + 1).astype(int),
+        "product_text": df_reset[col_prod],
+        "sku": df_reset[col_prod].apply(_extract_sku_from_product),
+        "net_sales_wo_vat": df_reset[col_net].apply(_to_number),
+        "cogs_wo_vat": df_reset[col_cogs].apply(_to_number),
+    })
+
+    base = base[base["sku"].notna()]
+    base = base[(base["net_sales_wo_vat"].notna()) | (base["cogs_wo_vat"].notna())]
+
+    if perioada != expected_period:
+        raise RuntimeError(f"Fișierul este pentru {perioada.strftime('%Y-%m')}, dar aici acceptăm doar {expected_period.strftime('%Y-%m')}.")
+
+    if base.empty:
+        return 0, 0, perioada
+
+    # completează staging.products pentru SKU-urile noi
+    product_rows = base[["sku", "product_text"]].to_dict(orient="records")
+    inserted = _ensure_products_from_profit(sb, product_rows)
+    if inserted:
+        st.info(f"Adăugate {inserted} SKU noi în staging.products.")
+
+    # purge pe lună în staging.raw_profit
+    sb.schema("staging").table("raw_profit").delete().eq("period_month", perioada.isoformat()).execute()
+
+    base = base.where(pd.notnull(base), None)
+    base["period_month"] = perioada.isoformat()
+    base["source_path"] = source_path
+
+    records = base.to_dict(orient="records")
+    written = 0
+    BATCH = 1000
+    for i in range(0, len(records), BATCH):
+        chunk = records[i:i+BATCH]
+        sb.schema("staging").table("raw_profit").insert(chunk).execute()
+        written += len(chunk)
+
+    return len(records), written, perioada
+
+
+def load_raw_miscari_to_catalog(xls_bytes: bytes, expected_period: date, source_path: str) -> Tuple[int, int, date]:
+    """
+    Încarcă mișcările în staging.raw_miscari (qty_out / val_out).
+    """
+    head = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, header=None, nrows=10)
+    period = extract_period_from_header(head)
+    if not period:
+        raise RuntimeError("Nu am putut detecta perioada din antet.")
+    if period != expected_period:
+        raise RuntimeError(f"Fișierul este pentru {period.strftime('%Y-%m')}, dar aici acceptăm doar {expected_period.strftime('%Y-%m')}.")
+
+    df = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, skiprows=9)
+    norm_map2 = {c: re.sub(r"[^a-z0-9]", "", str(c).lower()) for c in df.columns}
+
+    col_sku     = next((c for c in df.columns if norm_map2[c] in ["cod", "sku"]), None)
+    col_qty_out = next((c for c in df.columns if "iesiri" in norm_map2[c] and ".1" not in str(c)), None)
+    col_val_out = next((c for c in df.columns if "iesiri" in norm_map2[c] and ".1" in str(c)), None)
+    if not all([col_sku, col_qty_out, col_val_out]):
+        raise RuntimeError("Nu am găsit toate coloanele necesare în mișcări stocuri.")
+
+    df_reset = df.reset_index(drop=True)
+    out = pd.DataFrame({
+        "row_number": (df_reset.index + 1).astype(int),
+        "sku": df_reset[col_sku].astype(str).str.strip().str.upper(),
+        "qty_out": df_reset[col_qty_out].apply(parse_number),
+        "val_out": df_reset[col_val_out].apply(parse_number),
+    })
+
+    out = out[out["sku"].notna() & (out["sku"].str.len() > 0)]
+    if out.empty:
+        return 0, 0, period
+
+    # purge pe lună în staging.raw_miscari
+    sb.schema("staging").table("raw_miscari").delete().eq("period_month", period.isoformat()).execute()
+
+    out = out.where(pd.notnull(out), None)
+    out["period_month"] = period.isoformat()
+    out["source_path"] = source_path
+
+    records = out.to_dict(orient="records")
+    written = 0
+    BATCH = 1000
+    for i in range(0, len(records), BATCH):
+        chunk = records[i:i+BATCH]
+        sb.schema("staging").table("raw_miscari").insert(chunk).execute()
+        written += len(chunk)
+
+    return len(records), written, period
+
+
+# (opțional) în tab-ul Debug, citește din staging explicit
+def _debug_read_staging_month(sb: Client, month_iso: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    resp_p = sb.schema("staging").table("raw_profit").select("*").eq("period_month", month_iso).execute()
+    resp_m = sb.schema("staging").table("raw_miscari").select("*").eq("period_month", month_iso).execute()
+    return pd.DataFrame(resp_p.data or []), pd.DataFrame(resp_m.data or [])
+# ---- END PATCH ----
