@@ -65,14 +65,17 @@ mode_backfill = st.toggle("Permit backfill (luni anterioare)", value=False, help
 # ------- bloc: PROFIT --------
 with colA:
     st.subheader("Incarca Profit pe produs (Excel)")
-    f_profit = st.file_uploader("Alege fisier PROFIT", type=["xlsx", "xls"], key="up_profit")
+    f_profit = st.file_uploader("Alege fisier PROFIT", type=["xls", "xlsx"], key="up_profit")
     if f_profit is not None:
         try:
-            bio = io.BytesIO(f_profit.read())
-            # header pe randul 11 -> 0-based index 10
-            df = pd.read_excel(bio, engine="openpyxl", header=10)
-            # randul 5 pentru perioada -> 0-based index 4, coloana A sau intregul rand concat
-            meta = pd.read_excel(bio, engine="openpyxl", header=None, nrows=6)
+            # folosim functia utilitara pentru citire XLS
+            df = read_excel_file(f_profit)
+            # header pe randul 11 (0-based = index 10)
+            df.columns = df.iloc[10]
+            df = df.drop(index=range(0,11))
+
+            # randul 5 pentru perioada -> 0-based index 4
+            meta = read_excel_file(f_profit)
         except Exception as e:
             st.error(f"Nu pot citi Excel-ul: {e}")
             st.stop()
@@ -85,7 +88,7 @@ with colA:
             st.error(f"Perioada din fisier este {period_month}, dar nu este ultima luna incheiata. Upload respins.")
             st.stop()
 
-        # mapare coloane: B=Produsul, E=Vanzari nete (fara TVA), F=Cost bunuri vandute
+        # mapare coloane
         if "Produsul" not in df.columns:
             st.error("Nu gasesc coloana 'Produsul' pe randul de header 11.")
             st.stop()
@@ -93,9 +96,9 @@ with colA:
         df = df[["Produsul", "Vanzari nete", "Costul bunurilor vandute"]].rename(
             columns={"Produsul":"product_text", "Vanzari nete":"net_sales", "Costul bunurilor vandute":"cogs"}
         )
-        df = df.dropna(subset=["product_text"])  # ignora randuri goale
+        df = df.dropna(subset=["product_text"])
 
-        # extrage sku din paranteze (obligatoriu)
+        # extrage sku din paranteze
         def extract_sku(name: str):
             m = SKU_RE.search(str(name).strip())
             if not m:
@@ -108,9 +111,9 @@ with colA:
             st.error(f"{bad_rows} rand(uri) fara SKU intre paranteze. Upload respins.")
             st.stop()
 
-        # parsari numerice: format cu virgula la mii, punct la zecimale
-        df["net_sales"] = df["net_sales"].apply(parse_money_comma_thousands).round(2)
-        df["cogs"] = df["cogs"].apply(parse_money_comma_thousands).round(2)
+        # parsari numerice (XLS -> fara separatori mii, doar . zecimale)
+        df["net_sales"] = df["net_sales"].apply(parse_money_plain).round(2)
+        df["cogs"] = df["cogs"].apply(parse_money_plain).round(2)
 
         # pregateste inserturi
         rows = []
@@ -124,31 +127,33 @@ with colA:
                 "source_path": f_profit.name
             })
 
-        # scrie in staging
         if rows:
-            res = sb.table("profit_produs").insert(rows, table_schema="staging").execute()
-            # audit in file_registry
-            sb.table("file_registry").insert({
+            sb.schema("staging").table("profit_produs").insert(rows).execute()
+            sb.schema("ops").table("file_registry").insert({
                 "file_type":"profit",
                 "period_month": period_month.isoformat(),
                 "source_path": f_profit.name,
                 "rows_total": len(rows),
                 "rows_loaded": len(rows),
                 "status":"loaded_ok"
-            }, table_schema="ops").execute()
-
+            }).execute()
             st.success(f"Profit incarcat pentru {period_month}. Randuri: {len(rows)}")
+
 
 # ------- bloc: MISCARI --------
 with colB:
     st.subheader("Incarca Miscari stocuri (Excel)")
-    f_misc = st.file_uploader("Alege fisier MISCARE", type=["xlsx", "xls"], key="up_misc")
+    f_misc = st.file_uploader("Alege fisier MISCARE", type=["xls", "xlsx"], key="up_misc")
     if f_misc is not None:
         try:
-            bio2 = io.BytesIO(f_misc.read())
+            # citim fisierul cu functia utilitara
+            dfm = read_excel_file(f_misc)
             # header pe randul 10 -> 0-based index 9
-            dfm = pd.read_excel(bio2, engine="openpyxl", header=9)
-            meta2 = pd.read_excel(bio2, engine="openpyxl", header=None, nrows=6)
+            dfm.columns = dfm.iloc[9]
+            dfm = dfm.drop(index=range(0,10))
+
+            # randul 5 pentru perioada -> 0-based index 4
+            meta2 = read_excel_file(f_misc)
         except Exception as e:
             st.error(f"Nu pot citi Excel-ul: {e}")
             st.stop()
@@ -179,9 +184,9 @@ with colB:
             "val_out": dfm["Iesiri.1"].apply(parse_money_plain).round(2),
             "val_close": dfm["Sold final"].apply(parse_money_plain).round(2)
         })
-        dm = dm[dm["sku"] != ""]  # ignora randuri goale
+        dm = dm[dm["sku"] != ""]
 
-        # validari cheie conform regulilor B
+        # validari conform regulilor B
         if (dm["qty_open"] < 0).any() or (dm["qty_in"] < 0).any() or (dm["qty_close"] < 0).any():
             st.error("qty_open/qty_in/qty_close nu pot fi negative.")
             st.stop()
@@ -215,40 +220,17 @@ with colB:
             })
 
         if rows2:
-            sb.table("miscari_stocuri").insert(rows2, table_schema="staging").execute()
-            sb.table("file_registry").insert({
+            sb.schema("staging").table("miscari_stocuri").insert(rows2).execute()
+            sb.schema("ops").table("file_registry").insert({
                 "file_type":"miscari",
                 "period_month": period_month2.isoformat(),
                 "source_path": f_misc.name,
                 "rows_total": len(rows2),
                 "rows_loaded": len(rows2),
                 "status":"loaded_ok"
-            }, table_schema="ops").execute()
+            }).execute()
             st.success(f"Miscari incarcate pentru {period_month2}. Randuri: {len(rows2)}")
 
-st.divider()
-
-# ------- status si consolidare -------
-st.subheader("Status luni")
-status = sb.table("v_period_status").select("*").execute()
-df_status = pd.DataFrame(status.data or [])
-st.dataframe(df_status, use_container_width=True)
-
-# pregatite pentru consolidare (ambele fisiere incarcate si nu e consolidata)
-ready  = sb.table("v_ready_for_consolidation").select("*").execute()
-df_ready = pd.DataFrame(ready.data or [])
-
-st.subheader("Consolidare")
-if df_ready.empty:
-    st.info("Nicio luna pregatita (sau deja consolidata).")
-else:
-    sel = st.selectbox("Alege luna de consolidat", df_ready["period_month"].astype(str).tolist())
-    if st.button("Consolideaza luna selectata", type="primary"):
-        resp = sb.rpc("consolidate_month", {"p_period": sel}).execute()
-        st.success(f"Consolidare finalizata pentru {sel}.")
-        st.experimental_rerun()
-
-st.divider()
 
 # ------- Rapoarte --------
 st.subheader("Rapoarte")
