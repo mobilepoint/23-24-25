@@ -4,14 +4,35 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 from supabase import create_client, Client
-def read_excel_file(uploaded_file):
+import xlrd
+
+def read_excel_file(uploaded_file, header=None, nrows=None):
     """
-    Citeste fisiere Excel (XLS sau XLSX) din upload Streamlit.
+    Citeste fisiere Excel .xls (vechi) folosind xlrd==1.2.0.
+    Parametri:
+      header = index rand pentru antet (0-based) sau None
+      nrows  = cate randuri sa citeasca sau None = toate
     """
     content = uploaded_file.read()
-    # engine="xlrd" e necesar pentru fisiere XLS (format vechi)
-    df = pd.read_excel(io.BytesIO(content), engine="xlrd")
+    book = xlrd.open_workbook(file_contents=content)
+    sheet = book.sheet_by_index(0)
+
+    data = []
+    for row_idx in range(sheet.nrows):
+        row = sheet.row_values(row_idx)
+        data.append(row)
+
+    df = pd.DataFrame(data)
+
+    if header is not None:
+        df.columns = df.iloc[header]
+        df = df.drop(index=range(0, header+1))
+
+    if nrows is not None:
+        df = df.head(nrows)
+
     return df
+
 
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
@@ -64,18 +85,14 @@ mode_backfill = st.toggle("Permit backfill (luni anterioare)", value=False, help
 
 # ------- bloc: PROFIT --------
 with colA:
-    st.subheader("Incarca Profit pe produs (Excel)")
-    f_profit = st.file_uploader("Alege fisier PROFIT", type=["xls", "xlsx"], key="up_profit")
+    st.subheader("Incarca Profit pe produs (Excel XLS)")
+    f_profit = st.file_uploader("Alege fisier PROFIT", type=["xls"], key="up_profit")
     if f_profit is not None:
         try:
-            # folosim functia utilitara pentru citire XLS
-            df = read_excel_file(f_profit)
             # header pe randul 11 (0-based = index 10)
-            df.columns = df.iloc[10]
-            df = df.drop(index=range(0,11))
-
+            df = read_excel_file(f_profit, header=10)
             # randul 5 pentru perioada -> 0-based index 4
-            meta = read_excel_file(f_profit)
+            meta = read_excel_file(f_profit, nrows=6)
         except Exception as e:
             st.error(f"Nu pot citi Excel-ul: {e}")
             st.stop()
@@ -83,22 +100,23 @@ with colA:
         period_line = str(meta.iloc[4, 0])
         period_month = first_day_from_period_line(period_line)
 
-        # restrictie: doar ultima luna inchisa daca nu e backfill
         if not mode_backfill and period_month != last_closed_month():
             st.error(f"Perioada din fisier este {period_month}, dar nu este ultima luna incheiata. Upload respins.")
             st.stop()
 
-        # mapare coloane
         if "Produsul" not in df.columns:
             st.error("Nu gasesc coloana 'Produsul' pe randul de header 11.")
             st.stop()
 
         df = df[["Produsul", "Vanzari nete", "Costul bunurilor vandute"]].rename(
-            columns={"Produsul":"product_text", "Vanzari nete":"net_sales", "Costul bunurilor vandute":"cogs"}
+            columns={
+                "Produsul": "product_text",
+                "Vanzari nete": "net_sales",
+                "Costul bunurilor vandute": "cogs"
+            }
         )
         df = df.dropna(subset=["product_text"])
 
-        # extrage sku din paranteze
         def extract_sku(name: str):
             m = SKU_RE.search(str(name).strip())
             if not m:
@@ -111,11 +129,9 @@ with colA:
             st.error(f"{bad_rows} rand(uri) fara SKU intre paranteze. Upload respins.")
             st.stop()
 
-        # parsari numerice (XLS -> fara separatori mii, doar . zecimale)
         df["net_sales"] = df["net_sales"].apply(parse_money_plain).round(2)
         df["cogs"] = df["cogs"].apply(parse_money_plain).round(2)
 
-        # pregateste inserturi
         rows = []
         for _, r in df.iterrows():
             rows.append({
@@ -130,30 +146,25 @@ with colA:
         if rows:
             sb.schema("staging").table("profit_produs").insert(rows).execute()
             sb.schema("ops").table("file_registry").insert({
-                "file_type":"profit",
+                "file_type": "profit",
                 "period_month": period_month.isoformat(),
                 "source_path": f_profit.name,
                 "rows_total": len(rows),
                 "rows_loaded": len(rows),
-                "status":"loaded_ok"
+                "status": "loaded_ok"
             }).execute()
             st.success(f"Profit incarcat pentru {period_month}. Randuri: {len(rows)}")
 
-
 # ------- bloc: MISCARI --------
 with colB:
-    st.subheader("Incarca Miscari stocuri (Excel)")
-    f_misc = st.file_uploader("Alege fisier MISCARE", type=["xls", "xlsx"], key="up_misc")
+    st.subheader("Incarca Miscari stocuri (Excel XLS)")
+    f_misc = st.file_uploader("Alege fisier MISCARE", type=["xls"], key="up_misc")
     if f_misc is not None:
         try:
-            # citim fisierul cu functia utilitara
-            dfm = read_excel_file(f_misc)
-            # header pe randul 10 -> 0-based index 9
-            dfm.columns = dfm.iloc[9]
-            dfm = dfm.drop(index=range(0,10))
-
+            # header pe randul 10 (0-based = index 9)
+            dfm = read_excel_file(f_misc, header=9)
             # randul 5 pentru perioada -> 0-based index 4
-            meta2 = read_excel_file(f_misc)
+            meta2 = read_excel_file(f_misc, nrows=6)
         except Exception as e:
             st.error(f"Nu pot citi Excel-ul: {e}")
             st.stop()
@@ -186,7 +197,6 @@ with colB:
         })
         dm = dm[dm["sku"] != ""]
 
-        # validari conform regulilor B
         if (dm["qty_open"] < 0).any() or (dm["qty_in"] < 0).any() or (dm["qty_close"] < 0).any():
             st.error("qty_open/qty_in/qty_close nu pot fi negative.")
             st.stop()
@@ -194,7 +204,6 @@ with colB:
             st.error("val_open/val_in/val_close nu pot fi negative.")
             st.stop()
 
-        # toleranta ±5
         mis_qty = (dm["qty_open"] + dm["qty_in"] - dm["qty_out"] - dm["qty_close"]).abs() > 5
         mis_val = (dm["val_open"] + dm["val_in"] - dm["val_out"] - dm["val_close"]).abs() > 5
         bad = dm[mis_qty | mis_val]
@@ -222,12 +231,12 @@ with colB:
         if rows2:
             sb.schema("staging").table("miscari_stocuri").insert(rows2).execute()
             sb.schema("ops").table("file_registry").insert({
-                "file_type":"miscari",
+                "file_type": "miscari",
                 "period_month": period_month2.isoformat(),
                 "source_path": f_misc.name,
                 "rows_total": len(rows2),
                 "rows_loaded": len(rows2),
-                "status":"loaded_ok"
+                "status": "loaded_ok"
             }).execute()
             st.success(f"Miscari incarcate pentru {period_month2}. Randuri: {len(rows2)}")
 
