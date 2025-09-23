@@ -214,8 +214,7 @@ else:
     if st.button(btn_txt, type="primary", use_container_width=False):
         sb.rpc("consolidate_month", {"p_period": sel}).execute()
         st.success(f"Consolidare finalizată pentru {sel}.")
-        st.experimental_rerun()
-# ---------------------------------------------------------------------------
+        st.rerun()  # <-- înlocuiește st.experimental_rerun() cu st.rerun()
 
 # ==================== RAPOARTE ====================
 st.subheader("Rapoarte")
