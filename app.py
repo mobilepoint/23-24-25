@@ -248,7 +248,7 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.markdown("**Top sellers YTD**")
-    r1 = sb.table("top_sellers_ytd", table_schema="mart").select("*").execute()
+    r1 = sb.table("top_sellers_ytd").select("*").execute()
     st.dataframe(pd.DataFrame(r1.data or []), use_container_width=True)
 
     st.markdown("**Rolling 90**")
