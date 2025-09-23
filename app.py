@@ -89,9 +89,13 @@ with colA:
 
         # SKU din coloana B (ultima secvență între paranteze)
         data["sku"] = data["product_text"].apply(extract_sku_from_b)
-        if data["sku"].isna().any():
-            st.error("Există rânduri fără SKU (ultima secvență între paranteze) în coloana B. Upload respins.")
-            st.stop()
+
+        # ⚠️ ignorăm rândurile fără SKU
+        before = len(data)
+        data = data[~data["sku"].isna()].copy()
+        dropped = before - len(data)
+        if dropped > 0:
+            st.warning(f"Atenție: {dropped} rânduri fără SKU au fost ignorate (coloana B fără paranteze).")
 
         # Numerice (profit): virgulă la mii, punct la zecimale
         data["net_sales"] = data["net_sales"].apply(parse_money_comma_thousands).round(2)
