@@ -374,26 +374,7 @@ def load_profit_file_to_staging(xls_bytes: bytes, expected_period: date, source_
 # ---- END LOADER PROFIT: FUNCTION (ROW_NUMBER FIX) ----
 
 
-# ---------- TAB UPLOAD (unificat: Profit & Mișcări) ----------
-with tab_upload:
-    st.subheader("Încarcă fișierul pentru luna acceptată")
-    file_type = st.radio("Tip fișier", ["Profit pe produs", "Mișcări stocuri"], horizontal=True)
-    uploaded_file = st.file_uploader("Alege fișierul Excel/CSV", type=["xlsx", "xls", "csv"])
-
-    if uploaded_file is not None:
-        rows_json = []
-        try:
-            if file_type == "Profit pe produs":
-                # ---- UPLOAD: CALL PROFIT LOADER (ROW_NUMBER FIX) ----
-                data = uploaded_file.read()
-                rows_in, rows_written, period_detected = load_profit_file_to_staging(data, lcm, uploaded_file.name)
-                st.success(f"Import PROFIT OK ({period_detected.strftime('%Y-%m')}). Rânduri parse: {rows_in}, scrise în staging: {rows_written}.")
-                try:
-                    sb.rpc("mark_profit_loaded", {"p_period": lcm.isoformat(), "p_source_path": uploaded_file.name}).execute()
-                except Exception:
-                    pass
-                # ---- END UPLOAD: CALL PROFIT LOADER (ROW_NUMBER FIX) ----
-
+# ---- TAB UPLOAD: Mișcări stocuri (patched) ----
             else:  # Mișcări stocuri
                 try:
                     head = read_head_any(uploaded_file, nrows=10)
@@ -411,26 +392,42 @@ with tab_upload:
                     st.error(f"Fișierul este pentru {period.strftime('%Y-%m')}, dar aici acceptăm doar **{lcm.strftime('%Y-%m')}**.")
                     st.stop()
 
+                # Citire full (skip 9 rânduri până la header)
                 df = read_full_any(uploaded_file, skiprows=9)
 
+                # Normalizare headere
                 norm_map2 = {c: norm(c) for c in df.columns}
-                col_sku = next((c for c in df.columns if norm_map2[c] in ["cod", "cod1", "sku"]), None)
+
+                col_sku       = next((c for c in df.columns if norm_map2[c] in ["cod", "cod1", "sku"]), None)
                 col_qty_open  = next((c for c in df.columns if norm_map2[c].startswith("stocinitial")), None)
                 col_qty_in    = next((c for c in df.columns if norm_map2[c] == "intrari"), None)
-                col_qty_out   = next((c for c in df.columns if norm_map2[c].startswith("iesiri") and "." not in str(c)), None)
+
+                # Ia exact prima coloană "Ieșiri" pentru cantități (bucăți)
+                col_qty_out   = "Ieșiri" if "Ieșiri" in df.columns else next(
+                    (c for c in df.columns if norm_map2[c].startswith("iesiri") and ".1" not in str(c)), None
+                )
+
                 col_qty_close = next((c for c in df.columns if norm_map2[c].startswith("stocfinal")), None)
                 col_val_open  = next((c for c in df.columns if norm_map2[c].startswith("soldinitial")), None)
-                col_val_in    = "Intrari.1" if "Intrari.1" in df.columns else next((c for c in df.columns if norm_map2[c]=="intrari" and c != col_qty_in), None)
-                col_val_out   = next((c for c in df.columns if norm_map2[c]=="iesiri.1"), None)
-                if not col_val_out:
-                    dup_iesiri = [c for c in df.columns if norm_map2[c].startswith("iesiri")]
-                    if len(dup_iesiri) >= 2:
-                        col_val_out = dup_iesiri[1]
+
+                # Ia exact a doua coloană "Intrari.1" pentru valori (lei)
+                col_val_in    = "Intrari.1" if "Intrari.1" in df.columns else next(
+                    (c for c in df.columns if norm_map2[c] == "intrari" and c != col_qty_in), None
+                )
+
+                # Ia exact a doua coloană "Ieșiri.1" pentru valori (lei)
+                col_val_out   = "Ieșiri.1" if "Ieșiri.1" in df.columns else next(
+                    (c for c in df.columns if norm_map2[c].startswith("iesiri") and ".1" in str(c)), None
+                )
+
                 col_val_close = next((c for c in df.columns if norm_map2[c].startswith("soldfinal")), None)
 
-                if not all([col_sku, col_qty_open, col_qty_in, col_qty_out, col_qty_close, col_val_open, col_val_in, col_val_out, col_val_close]):
+                if not all([col_sku, col_qty_open, col_qty_in, col_qty_out, col_qty_close,
+                            col_val_open, col_val_in, col_val_out, col_val_close]):
                     raise ValueError("Nu am găsit toate coloanele necesare în mișcări stocuri.")
 
+                # Transformare în JSON pentru RPC
+                rows_json = []
                 for _, r in df.iterrows():
                     sku = str(r[col_sku]).strip()
                     if not sku or sku.lower() in ("nan", "none"):
@@ -450,6 +447,7 @@ with tab_upload:
                 if not rows_json:
                     raise ValueError("Nu am extras niciun rând valid (SKU).")
 
+                # Apel RPC
                 res = sb.rpc("load_miscari_file", {
                     "p_period": period.isoformat(),
                     "p_source_path": uploaded_file.name,
@@ -457,14 +455,10 @@ with tab_upload:
                 }).execute()
                 st.success(f"Încărcat MISCĂRI pentru {period.strftime('%Y-%m')}. file_id: {res.data}")
 
+                # Update balanțe
                 sb.rpc("update_balances_for_period", {"p_period": period.isoformat()}).execute()
                 st.info("Balanțele cantități/valori au fost verificate și marcate în registry.")
-
-        except Exception as e:
-            st.error(f"Eroare la procesarea fișierului: {e}")
-
-    st.divider()
-    st.caption("După ce ai încărcat **ambele** fișiere pentru luna acceptată și nu ai erori, folosește tabul „Consolidare & Rapoarte”.")
+# ---- END TAB UPLOAD: Mișcări stocuri (patched) ----
 
 # ---------- TAB CONSOLIDARE & Rapoarte ----------
 with tab_consol:
