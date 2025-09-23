@@ -4,3 +4,5 @@ pandas
 openpyxl
 xlrd
 python-dotenv
+pandas
+xlrd==1.2.0
