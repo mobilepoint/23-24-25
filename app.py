@@ -222,7 +222,7 @@ st.divider()
 
 # ------- status si consolidare -------
 st.subheader("Status luni")
-status = sb.table("v_period_status", table_schema="ops").select("*").execute()
+status = sb.table("ops.v_period_status").select("*").execute()
 df_status = pd.DataFrame(status.data or [])
 st.dataframe(df_status, use_container_width=True)
 
