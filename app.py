@@ -222,12 +222,12 @@ st.divider()
 
 # ------- status si consolidare -------
 st.subheader("Status luni")
-status = sb.schema("ops").table("v_period_status").select("*").execute()
+status = sb.table("v_period_status").select("*").execute()
 df_status = pd.DataFrame(status.data or [])
 st.dataframe(df_status, use_container_width=True)
 
 # pregatite pentru consolidare (ambele fisiere incarcate si nu e consolidata)
-ready = sb.schema("ops").table("v_ready_for_consolidation").select("*").execute()
+ready  = sb.table("v_ready_for_consolidation").select("*").execute()
 df_ready = pd.DataFrame(ready.data or [])
 
 st.subheader("Consolidare")
