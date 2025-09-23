@@ -618,6 +618,24 @@ def load_raw_miscari_to_catalog(xls_bytes: bytes, expected_period: date, source_
     return len(records), written, period
 # ---- END LOADER: RAW MISCĂRI ----
 
+# ---- TAB UPLOAD: apel loadere RAW în catalog ----
+with tab_upload:
+    st.subheader("Încarcă fișierul pentru luna acceptată (RAW → catalog)")
+    file_type = st.radio("Tip fișier", ["Profit pe produs", "Mișcări stocuri"], horizontal=True)
+    uploaded_file = st.file_uploader("Alege fișierul Excel (XLS/XLSX)", type=["xlsx", "xls"])
+
+    if uploaded_file is not None:
+        try:
+            data = uploaded_file.read()
+            if file_type == "Profit pe produs":
+                rows_in, rows_written, period_detected = load_raw_profit_to_catalog(data, lcm, uploaded_file.name)
+                st.success(f"Import RAW PROFIT OK ({period_detected.strftime('%Y-%m')}). Rânduri parse: {rows_in}, scrise: {rows_written}.")
+            else:
+                rows_in, rows_written, period_detected = load_raw_miscari_to_catalog(data, lcm, uploaded_file.name)
+                st.success(f"Import RAW MISCĂRI OK ({period_detected.strftime('%Y-%m')}). Rânduri parse: {rows_in}, scrise: {rows_written}.")
+        except Exception as e:
+            st.error(f"Eroare la procesarea fișierului: {e}")
+# ---- END TAB UPLOAD ----
 
 # ---------- TAB UPLOAD (unificat: Profit & Mișcări) ----------
 with tab_upload:
