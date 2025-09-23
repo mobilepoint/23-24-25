@@ -251,10 +251,11 @@ def _extract_sku_from_product(text: str) -> Optional[str]:
     m = re.search(r"\(([^()]+)\)\s*$", text)
     return m.group(1).strip() if m else None
 
-# ---- LOADER PROFIT: FUNCTION (ROW_NUMBER FIX) ----
+# ---- LOADER PROFIT: FUNCTION (ROW_NUMBER FIX + PURGE) ----
 def load_profit_file_to_staging(xls_bytes: bytes, expected_period: date, source_path: str) -> Tuple[int, int, date]:
     """
     Parsează 'Raport profit pe produs' și scrie în staging.profit_produs.
+    Curăță întâi datele existente pentru luna respectivă (purge).
     Include coloana obligatorie row_number (1..n din fișier).
     Returnează (rows_in, rows_written, perioada_detectată).
     """
@@ -262,12 +263,10 @@ def load_profit_file_to_staging(xls_bytes: bytes, expected_period: date, source_
 
     # citire cu header pe rândul 11 -> header=10
     df_raw = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, header=10)
-    # elimină coloanele complet goale
     df_raw = df_raw.loc[:, ~df_raw.columns.to_series().astype(str).str.fullmatch(r"\s*nan\s*", case=False)]
     norm_map = _normalize_columns(df_raw.columns)
 
-    # === alegere coloane ===
-    # produs
+    # identificare coloane
     col_prod = None
     for c in df_raw.columns:
         if norm_map[c] in ("produsul", "produs"):
@@ -276,7 +275,6 @@ def load_profit_file_to_staging(xls_bytes: bytes, expected_period: date, source_
     if col_prod is None and len(df_raw.columns) >= 2:
         col_prod = df_raw.columns[1]
 
-    # candidați NET/COGS (data-driven)
     def candidates_for(keys_contains: list[str]) -> list[str]:
         cans = []
         for c in df_raw.columns:
@@ -285,7 +283,6 @@ def load_profit_file_to_staging(xls_bytes: bytes, expected_period: date, source_
                 cans.append(c)
         for idx in range(3, min(9, len(df_raw.columns))):
             cans.append(df_raw.columns[idx])
-        # unicizează menținând ordinea
         seen, out = set(), []
         for c in cans:
             if c not in seen:
@@ -309,15 +306,14 @@ def load_profit_file_to_staging(xls_bytes: bytes, expected_period: date, source_
     col_net = pick_best_numeric(candidates_for(["vanzari", "nete"]))
     col_cogs = pick_best_numeric(candidates_for(["cost", "bunurilor"])) or pick_best_numeric(candidates_for(["cogs"]))
 
-    if col_net is None and len(df_raw.columns) >= 5:  # fallback E
+    if col_net is None and len(df_raw.columns) >= 5:
         col_net = df_raw.columns[4]
-    if col_cogs is None and len(df_raw.columns) >= 6:  # fallback F
+    if col_cogs is None and len(df_raw.columns) >= 6:
         col_cogs = df_raw.columns[5]
 
     if not col_prod or not col_net or not col_cogs:
         raise RuntimeError("Nu reușesc să identific coloanele pentru Produs / Vânzări nete / Cost bunuri vândute.")
 
-    # === construim tabelul cu row_number (1..n) ===
     df_reset = df_raw.reset_index(drop=True)
     base = pd.DataFrame({
         "row_number": (df_reset.index + 1).astype(int),
@@ -326,30 +322,24 @@ def load_profit_file_to_staging(xls_bytes: bytes, expected_period: date, source_
         "cogs_wo_vat": df_reset[col_cogs].apply(_to_number),
     })
 
-    # filtre: fără SKU și fără rânduri complet nule
     base = base[base["sku"].notna()]
     base = base[(base["net_sales_wo_vat"].notna()) | (base["cogs_wo_vat"].notna())]
 
-    # preview
     st.info(
         f"Preview import PROFIT: rânduri parse {len(base)}, "
-        f"net≠NULL în sample: {int(base.head(10)['net_sales_wo_vat'].notna().sum())}, "
         f"suma NET total: {float(base['net_sales_wo_vat'].fillna(0).sum()):,.2f}"
     )
     st.dataframe(base.head(10), use_container_width=True)
 
-    # validare lună
     if perioada != expected_period:
         raise RuntimeError(
             f"Fișierul este pentru {perioada.strftime('%Y-%m')}, dar aici acceptăm doar {expected_period.strftime('%Y-%m')}."
         )
 
-    # pregătire pentru insert
     if base.empty:
         return 0, 0, perioada
 
     base = base.where(pd.notnull(base), None)
-    # IMPORTANT: perioada_luna ca string ISO pentru compatibilitate JSON
     base["perioada_luna"] = perioada.isoformat()
 
     records = base[["row_number", "perioada_luna", "sku", "net_sales_wo_vat", "cogs_wo_vat"]].to_dict(orient="records")
@@ -357,6 +347,9 @@ def load_profit_file_to_staging(xls_bytes: bytes, expected_period: date, source_
     written = 0
     BATCH = 1000
     try:
+        # purge înainte de insert
+        sb.rpc("purge_staging_before_insert", {"p_table": "profit_produs", "p_period": perioada.isoformat()}).execute()
+
         for i in range(0, len(records), BATCH):
             chunk = records[i:i + BATCH]
             sb.schema("staging").table("profit_produs").insert(chunk).execute()
@@ -366,12 +359,13 @@ def load_profit_file_to_staging(xls_bytes: bytes, expected_period: date, source_
         if "permission denied for sequence" in msg and "42501" in msg:
             st.error(
                 "🔐 Permisiune insuficientă pentru secvența ID din `staging.profit_produs`.\n"
-                "Soluție în SQL: GRANT USAGE, SELECT ON SEQUENCE staging.profit_produs_id_seq TO anon, authenticated;"
+                "SQL fix: GRANT USAGE, SELECT ON SEQUENCE staging.profit_produs_id_seq TO anon, authenticated;"
             )
         raise
 
     return len(base), written, perioada
-# ---- END LOADER PROFIT: FUNCTION (ROW_NUMBER FIX) ----
+# ---- END LOADER PROFIT: FUNCTION (ROW_NUMBER FIX + PURGE) ----
+
 
 
 # ---- TAB UPLOAD ----
