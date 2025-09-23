@@ -371,7 +371,9 @@ def load_raw_profit_to_catalog(xls_bytes: bytes, expected_period: date, source_p
     base = base[(base["net_sales_wo_vat"].notna()) | (base["cogs_wo_vat"].notna())]
 
     if perioada != expected_period:
-        raise RuntimeError(f"Fișierul este pentru {perioada.strftime('%Y-%m')}, dar aici acceptăm doar {expected_period.strftime('%Y-%m']}.")
+        raise RuntimeError(
+            f"Fișierul este pentru {perioada.strftime('%Y-%m')}, dar aici acceptăm doar {expected_period.strftime('%Y-%m')}."
+        )
 
     if base.empty:
         return 0, 0, perioada
@@ -401,6 +403,87 @@ def load_raw_profit_to_catalog(xls_bytes: bytes, expected_period: date, source_p
 
     return len(records), written, perioada
 # ---- END LOADER: RAW PROFIT ----
+
+# ---- LOADER: RAW MISCĂRI (catalog.raw_miscari) ----
+def load_raw_miscari_to_catalog(xls_bytes: bytes, expected_period: date, source_path: str) -> tuple[int, int, date]:
+    """
+    Încarcă 'Mișcări stocuri' în catalog.raw_miscari:
+    - detectează perioada din antet
+    - header la rândul 10 (skiprows=9)
+    - row_number = 1..n
+    - mapare strictă pe cantități/valori (qty_out = 'Ieșiri'/'Iesiri', val_out = 'Ieșiri.1'/'Iesiri.1', etc.)
+    - purge pe luna importată înainte de insert (doar în catalog.raw_miscari)
+    """
+    # detectare perioadă din antet
+    head = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, header=None, nrows=10)
+    period = extract_period_from_header(head)
+    if not period:
+        raise RuntimeError("Nu am putut detecta perioada din antet.")
+    if period != expected_period:
+        raise RuntimeError(
+            f"Fișierul este pentru {period.strftime('%Y-%m')}, dar aici acceptăm doar {expected_period.strftime('%Y-%m')}."
+        )
+
+    # citire tabel
+    df = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, skiprows=9)
+    norm_map2 = {c: norm(c) for c in df.columns}
+
+    col_sku       = next((c for c in df.columns if norm_map2[c] in ["cod", "cod1", "sku"]), None)
+    col_qty_open  = next((c for c in df.columns if norm_map2[c].startswith("stocinitial")), None)
+    col_qty_in    = next((c for c in df.columns if norm_map2[c] == "intrari"), None)
+
+    # cantități: 'Iesiri'/'Ieșiri' (qty) vs 'Iesiri.1'/'Ieșiri.1' (val)
+    col_qty_out   = next((c for c in df.columns if norm_map2[c].startswith("iesiri") and ".1" not in str(c).lower()), None)
+    col_qty_close = next((c for c in df.columns if norm_map2[c].startswith("stocfinal")), None)
+
+    # valori
+    col_val_open  = next((c for c in df.columns if norm_map2[c].startswith("soldinitial")), None)
+    col_val_in    = next((c for c in df.columns if norm_map2[c] == "intrari.1" or (norm_map2[c] == "intrari" and c != col_qty_in)), None)
+    col_val_out   = next((c for c in df.columns if norm_map2[c].startswith("iesiri") and ".1" in str(c).lower()), None)
+    col_val_close = next((c for c in df.columns if norm_map2[c].startswith("soldfinal")), None)
+
+    if not all([col_sku, col_qty_open, col_qty_in, col_qty_out, col_qty_close, col_val_open, col_val_in, col_val_out, col_val_close]):
+        raise RuntimeError("Nu am găsit toate coloanele necesare în mișcări stocuri.")
+
+    df_reset = df.reset_index(drop=True)
+    out = pd.DataFrame({
+        "row_number": (df_reset.index + 1).astype(int),
+        "product_text": df_reset.get("Produsul") if "Produsul" in df_reset.columns else None,
+        "sku": df_reset[col_sku].astype(str).str.strip().str.upper(),
+        "qty_open":  df_reset[col_qty_open].apply(_to_number),
+        "qty_in":    df_reset[col_qty_in].apply(_to_number),
+        "qty_out":   df_reset[col_qty_out].apply(_to_number),
+        "qty_close": df_reset[col_qty_close].apply(_to_number),
+        "val_open":  df_reset[col_val_open].apply(_to_number),
+        "val_in":    df_reset[col_val_in].apply(_to_number),
+        "val_out":   df_reset[col_val_out].apply(_to_number),
+        "val_close": df_reset[col_val_close].apply(_to_number),
+    })
+
+    out = out[out["sku"].notna() & (out["sku"].str.len() > 0)]
+
+    if out.empty:
+        return 0, 0, period
+
+    # purge pe lună
+    sb.schema("catalog").table("raw_miscari").delete().eq("period_month", period.isoformat()).execute()
+
+    # insert în batch
+    out = out.where(pd.notnull(out), None)
+    out["period_month"] = period.isoformat()
+    out["source_path"]  = source_path
+
+    records = out.to_dict(orient="records")
+    written = 0
+    BATCH = 1000
+    for i in range(0, len(records), BATCH):
+        chunk = records[i:i+BATCH]
+        sb.schema("catalog").table("raw_miscari").insert(chunk).execute()
+        written += len(chunk)
+
+    return len(records), written, period
+# ---- END LOADER: RAW MISCĂRI ----
+
 
 # ---- LOADER: RAW MISCĂRI (catalog.raw_miscari) ----
 def load_raw_miscari_to_catalog(xls_bytes: bytes, expected_period: date, source_path: str) -> tuple[int, int, date]:
