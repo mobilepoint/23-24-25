@@ -64,14 +64,27 @@ colA, colB = st.columns(2)
 mode_backfill = st.toggle("Permit backfill (luni anterioare)", value=False)
 
 # ==================== PROFIT (XLS) ====================
+# -- PROFIT UPLOAD -----------------------------------------------------------
 with colA:
     st.subheader("Încarcă Profit pe produs (Excel .XLS)")
+    overwrite_profit = st.toggle(
+        "Suprascrie luna dacă există (PROFIT)", 
+        value=False, 
+        help="Șterge din staging perioada înainte de încărcare"
+    )
     f_profit = st.file_uploader("Alege fișier PROFIT", type=["xls"], key="up_profit")
     if f_profit is not None:
-        try:
-            sheet = read_xls_return_df(f_profit)
-            # Perioada: rândul 5 (index 4), col. A (index 0)
-            period_month = first_day_from_period_line(sheet.iloc[4, 0])
+        sheet = read_xls_return_df(f_profit)
+        period_month = first_day_from_period_line(sheet.iloc[4, 0])
+
+        # dacă bifezi overwrite -> curăță staging + file_registry (tip profit)
+        if overwrite_profit:
+            st.info(f"Șterg staging PROFIT pentru {period_month}…")
+            sb.rpc("reset_staging_for_period", {
+                "p_period": str(period_month), 
+                "p_type": "profit"
+            }).execute()
+
 
             # Date: încep după headerul din rândul 11 -> de la rândul 12 (index 11)
             # Indici (0-based): B=1 (prod), E=4 (net_sales), F=5 (cogs)
@@ -126,10 +139,22 @@ with colA:
 # ==================== MISCĂRI (XLS) ====================
 with colB:
     st.subheader("Încarcă Mișcări stocuri (Excel .XLS)")
+    overwrite_misc = st.toggle(
+        "Suprascrie luna dacă există (MISCĂRI)", 
+        value=False, 
+        help="Șterge din staging perioada înainte de încărcare"
+    )
     f_misc = st.file_uploader("Alege fișier MISCĂRI", type=["xls"], key="up_misc")
     if f_misc is not None:
-        try:
-            sheet2 = read_xls_return_df(f_misc)
+        sheet2 = read_xls_return_df(f_misc)
+        period_month2 = first_day_from_period_line(sheet2.iloc[4, 0])
+
+        if overwrite_misc:
+            st.info(f"Șterg staging MISCĂRI pentru {period_month2}…")
+            sb.rpc("reset_staging_for_period", {
+                "p_period": str(period_month2), 
+                "p_type": "miscari"
+            }).execute()
             # Perioada: rândul 5 (index 4), col. A (index 0)
             period_month2 = first_day_from_period_line(sheet2.iloc[4, 0])
 
@@ -206,25 +231,36 @@ with colB:
 st.divider()
 
 # ==================== STATUS & CONSOLIDARE ====================
-st.subheader("Status luni")
-status = sb.table("v_period_status").select("*").execute()   # public proxy -> ops
-df_status = pd.DataFrame(status.data or [])
-st.dataframe(df_status, use_container_width=True)
-
-ready = sb.table("v_ready_for_consolidation").select("*").execute()  # public proxy -> ops
-df_ready = pd.DataFrame(ready.data or [])
-
 st.subheader("Consolidare")
-if df_ready.empty:
+
+allow_recon = st.toggle(
+    "Permite reconsolidare (overwrite)", 
+    value=False,
+    help="Afișează și lunile deja consolidate și permite reconsolidarea"
+)
+
+if allow_recon:
+    # arată toate lunile unde ambele seturi sunt încărcate
+    q = sb.schema("ops").table("period_registry") \
+         .select("period_month, profit_loaded, miscari_loaded") \
+         .eq("profit_loaded", True).eq("miscari_loaded", True) \
+         .order("period_month", desc=True).execute()
+    ready_list = [r["period_month"] for r in (q.data or [])]
+else:
+    # păstrează lista strictă (view-ul existent)
+    ready = sb.table("v_ready_for_consolidation").select("*").execute()
+    ready_list = [r["period_month"] for r in (ready.data or [])]
+
+if not ready_list:
     st.info("Nicio lună pregătită (sau deja consolidată).")
 else:
-    sel = st.selectbox("Alege luna de consolidat", df_ready["period_month"].astype(str).tolist())
-    if st.button("Consolidează luna selectată", type="primary"):
+    sel = st.selectbox("Alege luna de consolidat", [str(x) for x in ready_list])
+    btn_txt = "Reconsolidează luna selectată (overwrite)" if allow_recon else "Consolidează luna selectată"
+
+    if st.button(btn_txt, type="primary", use_container_width=False):
         sb.rpc("consolidate_month", {"p_period": sel}).execute()
         st.success(f"Consolidare finalizată pentru {sel}.")
         st.experimental_rerun()
-
-st.divider()
 
 # ==================== RAPOARTE ====================
 st.subheader("Rapoarte")
