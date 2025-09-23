@@ -287,7 +287,11 @@ with colL:
     if up_profit is not None:
         try:
             df_profit, ignored = parse_profit_xls(io.BytesIO(up_profit.read()))
-            period = df_profit["period_month"].iloc[0] if not df_profit.empty else None
+                   if df_profit.empty:
+                st.error("Fișierul PROFIT nu conține niciun rând valid (SKU).")
+                st.stop()
+
+            period = df_profit["period_month"].iloc[0]
 
             if period and (period >= date.today().replace(day=1) or (not backfill and period < date.today().replace(day=1))):
                 # regulă: accepți doar ultima lună încheiată dacă backfill = False
@@ -297,13 +301,13 @@ with colL:
                     st.stop()
 
             # overwrite în staging
-            delete_staging_for_period("profit_produs", df_profit["period_month"].iloc[0])
+            delete_staging_for_period("profit_produs", period)
             inserted = insert_rows("profit_produs", df_profit.to_dict(orient="records"))
-            register_file(df_profit["period_month"].iloc[0], "profit", up_profit.name)
+            register_file(period, "profit", up_profit.name)
 
             if ignored:
                 st.warning(f"Atenție: {ignored} rânduri fără SKU au fost ignorate (coloana B fără paranteze).")
-            st.success(f"Profit încărcat pentru {df_profit['period_month'].iloc[0]}. Rânduri: {inserted}")
+            st.success(f"Profit încărcat pentru {period}. Rânduri: {inserted}")
         except Exception as e:
             st.error(f"Nu am putut procesa fișierul PROFIT: {e}")
 
@@ -317,6 +321,12 @@ with colR:
     if up_misc is not None:
         try:
             df_misc, errs = parse_miscari_xls(io.BytesIO(up_misc.read()))
+            
+            if df_misc.empty:
+                st.error("Fișierul MISCARE nu conține rânduri valide.")
+                st.stop()
+
+            period = df_misc["period_month"].iloc[0]
             if errs:
                 with st.expander("Erori de validare găsite", expanded=False):
                     for e in errs:
@@ -325,10 +335,10 @@ with colR:
                     st.error("Există erori de balanță; încarcă un fișier corect.")
                     st.stop()
 
-            delete_staging_for_period("miscari_stocuri", df_misc["period_month"].iloc[0])
+            delete_staging_for_period("miscari_stocuri", period)
             inserted = insert_rows("miscari_stocuri", df_misc.to_dict(orient="records"))
-            register_file(df_misc["period_month"].iloc[0], "miscari", up_misc.name)
-            st.success(f"Mișcări încărcate pentru {df_misc['period_month'].iloc[0]}. Rânduri: {inserted}")
+            register_file(period, "miscari", up_misc.name)
+            st.success(f"Mișcări încărcate pentru {period}. Rânduri: {inserted}")
         except Exception as e:
             st.error(f"Nu am putut procesa fișierul MISCARE: {e}")
 
