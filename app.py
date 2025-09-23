@@ -27,6 +27,67 @@ except Exception as e:
     st.error(f"Eroare conectare Supabase: {e}")
     st.stop()
 
+# ---- HELPERS PT. PRODUSE (SKU + NUME) ----
+def _extract_product_name(product_text: str) -> str:
+    """
+    Din 'Produsul' extrage numele fără ultimul (...) (care de obicei e SKU).
+    Exemplu: 'Carcasa Samsung A50 (negru) (GH82-30465A)' -> 'Carcasa Samsung A50 (negru)'
+    Dacă nu găsește paranteze, returnează textul original curățat.
+    """
+    if not isinstance(product_text, str):
+        product_text = str(product_text or "")
+    # elimină ultimul grup parantezat de la final
+    m = re.search(r"\s*\([^()]*\)\s*$", product_text)
+    if m:
+        return product_text[:m.start()].strip()
+    return product_text.strip()
+
+def _ensure_products_from_profit(sb: Client, rows: list[dict]) -> int:
+    """
+    Primește rânduri din profit (cu 'sku' și 'product_text').
+    - normalizează SKU: UPPER + trim
+    - extrage numele cu _extract_product_name
+    - inserează NUMAI SKU-urile care NU există deja în catalog.products
+    Returnează câte produse noi a inserat.
+    """
+    # 1) strânge candidații unici
+    candidates = {}
+    for r in rows:
+        sku = (str(r.get("sku") or "").strip().upper())
+        if not sku:
+            continue
+        if sku not in candidates:
+            name = _extract_product_name(r.get("product_text"))
+            candidates[sku] = name
+
+    if not candidates:
+        return 0
+
+    sku_list = list(candidates.keys())
+
+    # 2) extrage ce există deja
+    existing = set()
+    try:
+        # chunk deoarece .in_ are limitări
+        CH = 1000
+        for i in range(0, len(sku_list), CH):
+            part = sku_list[i:i+CH]
+            resp = sb.schema("catalog").table("products").select("sku").in_("sku", part).execute()
+            for row in (resp.data or []):
+                existing.add((row.get("sku") or "").upper())
+    except Exception:
+        pass
+
+    # 3) pregătește doar pe cei lipsă
+    to_insert = [{"sku": sku, "name": candidates[sku]} for sku in sku_list if sku not in existing]
+    if not to_insert:
+        return 0
+
+    # 4) insert
+    sb.schema("catalog").table("products").insert(to_insert).execute()
+    return len(to_insert)
+# ---- END HELPERS PT. PRODUSE ----
+
 # ===================== HELPERI BUSINESS ==================
 TZ = ZoneInfo("Europe/Bucharest")
 
