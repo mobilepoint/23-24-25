@@ -226,6 +226,113 @@ def read_full_any(uploaded_file, skiprows: int) -> pd.DataFrame:
 # =============== LOADER PROFIT — INTEGRAT =================
 # =========================================================
 
+# ---- LOADER: RAW PROFIT (catalog.raw_profit + products) ----
+def load_raw_profit_to_catalog(xls_bytes: bytes, expected_period: date, source_path: str) -> tuple[int, int, date]:
+    """
+    Încarcă raportul 'Profit pe produs' în catalog.raw_profit.
+    - extrage period_month din antet
+    - parsează header (rând 11, adică header=10)
+    - row_number = 1..n
+    - normalizează numere (mii '.'/spațiu/NBSP, decimale ','/'.')
+    - adaugă SKU-urile noi în catalog.products (cu numele din fișierul de profit)
+    - purge pe luna importată înainte de insert (doar în catalog.raw_profit)
+    Returnează (rows_in, rows_written, period_detected)
+    """
+    perioada = _extract_period_from_profit_header(xls_bytes)
+
+    # citire cu header pe rândul 11 -> header=10
+    df_raw = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=0, header=10)
+    # elimină coloanele complet goale
+    df_raw = df_raw.loc[:, ~df_raw.columns.to_series().astype(str).str.fullmatch(r"\s*nan\s*", case=False)]
+    norm_map = _normalize_columns(df_raw.columns)
+
+    # găsire coloane
+    col_prod = next((c for c in df_raw.columns if norm_map[c] in ("produsul", "produs")), None)
+    if col_prod is None and len(df_raw.columns) >= 2:
+        col_prod = df_raw.columns[1]
+
+    # candidați pentru net și cogs
+    def candidates_for(keys_contains: list[str]) -> list[str]:
+        cans = []
+        for c in df_raw.columns:
+            k = norm_map[c]
+            if all(sub in k for sub in keys_contains):
+                cans.append(c)
+        # fallback: primele coloane numerice după B
+        for idx in range(3, min(9, len(df_raw.columns))):
+            cans.append(df_raw.columns[idx])
+        # unicizează
+        seen, out = set(), []
+        for c in cans:
+            if c not in seen:
+                out.append(c); seen.add(c)
+        return out
+
+    def pick_best_numeric(cols: list[str]) -> Optional[str]:
+        best_col, best_nonnull, best_sum = None, -1, -1.0
+        for c in cols:
+            try:
+                s = df_raw[c].apply(_to_number)
+            except Exception:
+                continue
+            nonnull = int(s.notna().sum())
+            total = float(s.fillna(0).sum())
+            if nonnull > best_nonnull or (nonnull == best_nonnull and total > best_sum):
+                best_col, best_nonnull, best_sum = c, nonnull, total
+        return best_col
+
+    col_net  = pick_best_numeric(candidates_for(["vanzari", "nete"]))
+    col_cogs = pick_best_numeric(candidates_for(["cost", "bunurilor"])) or pick_best_numeric(candidates_for(["cogs"]))
+
+    if not col_prod or not col_net or not col_cogs:
+        raise RuntimeError("Nu pot identifica coloanele obligatorii: Produsul / Vanzari nete / Costul bunurilor vandute.")
+
+    # construim baza
+    df_reset = df_raw.reset_index(drop=True)
+    base = pd.DataFrame({
+        "row_number": (df_reset.index + 1).astype(int),
+        "product_text": df_reset[col_prod],
+        "sku": df_reset[col_prod].apply(_extract_sku_from_product),
+        "net_sales_wo_vat": df_reset[col_net].apply(_to_number),
+        "cogs_wo_vat": df_reset[col_cogs].apply(_to_number),
+    })
+
+    # filtre valide
+    base = base[base["sku"].notna()]
+    base = base[(base["net_sales_wo_vat"].notna()) | (base["cogs_wo_vat"].notna())]
+
+    if perioada != expected_period:
+        raise RuntimeError(f"Fișierul este pentru {perioada.strftime('%Y-%m')}, dar aici acceptăm doar {expected_period.strftime('%Y-%m')}.")
+
+    if base.empty:
+        return 0, 0, perioada
+
+    # 1) completează produse pentru SKU-urile noi
+    product_rows = base[["sku", "product_text"]].to_dict(orient="records")
+    inserted = _ensure_products_from_profit(sb, product_rows)
+    if inserted:
+        st.info(f"Adăugate {inserted} SKU noi în catalog.products.")
+
+    # 2) purge luna în raw_profit
+    sb.schema("catalog").table("raw_profit").delete().eq("period_month", perioada.isoformat()).execute()
+
+    # 3) insert în batch
+    base = base.where(pd.notnull(base), None)
+    base["period_month"] = perioada.isoformat()
+    base["source_path"] = source_path
+
+    records = base[["period_month","row_number","product_text","sku","net_sales_wo_vat","cogs_wo_vat","source_path"]].to_dict(orient="records")
+
+    written = 0
+    BATCH = 1000
+    for i in range(0, len(records), BATCH):
+        chunk = records[i:i+BATCH]
+        sb.schema("catalog").table("raw_profit").insert(chunk).execute()
+        written += len(chunk)
+
+    return len(records), written, perioada
+# ---- END LOADER: RAW PROFIT ----
+
 # ---- LOADER PROFIT: NUMERIC CONVERSION ----
 NBSP = "\xa0"  # non-breaking space
 
