@@ -4,6 +4,14 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 from supabase import create_client, Client
+def read_excel_file(uploaded_file):
+    """
+    Citeste fisiere Excel (XLS sau XLSX) din upload Streamlit.
+    """
+    content = uploaded_file.read()
+    # engine="xlrd" e necesar pentru fisiere XLS (format vechi)
+    df = pd.read_excel(io.BytesIO(content), engine="xlrd")
+    return df
 
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
