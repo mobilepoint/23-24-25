@@ -13,17 +13,19 @@ def read_excel_file(uploaded_file, header=None, nrows=None):
       header = index rand pentru antet (0-based) sau None
       nrows  = cate randuri sa citeasca sau None = toate
     """
-    content = uploaded_file.read()
+    # citim bytes și resetăm pointerul pentru eventuale alte utilizari
+    content = uploaded_file.getvalue()
+
     book = xlrd.open_workbook(file_contents=content)
     sheet = book.sheet_by_index(0)
 
     data = []
     for row_idx in range(sheet.nrows):
-        row = sheet.row_values(row_idx)
-        data.append(row)
+        data.append(sheet.row_values(row_idx))
 
     df = pd.DataFrame(data)
 
+    # dacă e nevoie, setăm header și tăiem primele rânduri
     if header is not None:
         df.columns = df.iloc[header]
         df = df.drop(index=range(0, header+1))
@@ -89,9 +91,9 @@ with colA:
     f_profit = st.file_uploader("Alege fisier PROFIT", type=["xls"], key="up_profit")
     if f_profit is not None:
         try:
-            # header pe randul 11 (0-based = index 10)
+            # header pe randul 11 (0-based = 10)
             df = read_excel_file(f_profit, header=10)
-            # randul 5 pentru perioada -> 0-based index 4
+            # randul 5 pentru perioada (0-based = 4)
             meta = read_excel_file(f_profit, nrows=6)
         except Exception as e:
             st.error(f"Nu pot citi Excel-ul: {e}")
@@ -161,9 +163,9 @@ with colB:
     f_misc = st.file_uploader("Alege fisier MISCARE", type=["xls"], key="up_misc")
     if f_misc is not None:
         try:
-            # header pe randul 10 (0-based = index 9)
+            # header pe randul 10 (0-based = 9)
             dfm = read_excel_file(f_misc, header=9)
-            # randul 5 pentru perioada -> 0-based index 4
+            # randul 5 pentru perioada (0-based = 4)
             meta2 = read_excel_file(f_misc, nrows=6)
         except Exception as e:
             st.error(f"Nu pot citi Excel-ul: {e}")
@@ -239,7 +241,6 @@ with colB:
                 "status": "loaded_ok"
             }).execute()
             st.success(f"Miscari incarcate pentru {period_month2}. Randuri: {len(rows2)}")
-
 
 # ------- Rapoarte --------
 st.subheader("Rapoarte")
