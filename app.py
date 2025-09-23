@@ -252,14 +252,14 @@ with col1:
     st.dataframe(pd.DataFrame(r1.data or []), use_container_width=True)
 
     st.markdown("**Rolling 90**")
-    r2 = sb.table("sales_rolling_90", table_schema="mart").select("*").execute()
+    r2 = sb.table("sales_rolling_90").select("*").execute()
     st.dataframe(pd.DataFrame(r2.data or []), use_container_width=True)
 
 with col2:
     st.markdown("**Stock health**")
-    r3 = sb.table("stock_health", table_schema="mart").select("*").execute()
+    r3 = sb.table("stock_health").select("*").execute()
     st.dataframe(pd.DataFrame(r3.data or []), use_container_width=True)
 
     st.markdown("**Recomandari comanda**")
-    r4 = sb.table("recomandari_comanda", table_schema="mart").select("*").execute()
+    r4 = sb.table("recomandari_comanda").select("*").execute()
     st.dataframe(pd.DataFrame(r4.data or []), use_container_width=True)
